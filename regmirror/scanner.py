@@ -20,6 +20,16 @@ only if the device commits at most 32767 times during a single scan
 (``MAX_COMMITS_PER_SCAN``).  32768 commits would alias to the same
 version word; that is a deployment contract, not something the scanner
 can detect.
+
+Barrier mirror protocol (``Scanner.mirror``): each target device keeps
+an immutable history of commits with dense sequence numbers.  For the
+requested barrier the scanner resolves every device's *last commit with
+sequence <= barrier*, pins it (a pinned commit is exempt from bounded
+history pruning), then reads all of its groups out of that one frozen
+image.  New device commits during the reads therefore cannot mix into a
+field.  If any device has no commit at or before the barrier, or the
+needed commit was pruned, :class:`SnapshotUnavailableError` is raised
+and no partial mirror is published.
 """
 
 from __future__ import annotations
@@ -33,6 +43,7 @@ from .errors import (
     ConfigError,
     InconsistentRead,
     InconsistentScanError,
+    SnapshotUnavailableError,
 )
 from .fields import FieldSpec, FieldValue, decode_field
 
@@ -42,6 +53,9 @@ __all__ = [
     "ScanConfig",
     "GroupSnapshot",
     "Snapshot",
+    "DeviceTarget",
+    "DeviceSnapshot",
+    "Mirror",
     "Scanner",
 ]
 
@@ -176,6 +190,111 @@ class Snapshot:
         return len(self.groups)
 
 
+def _decode_group_data(
+    group: "RegisterGroup", data: dict[int, int]
+) -> tuple[FieldValue, ...]:
+    return tuple(
+        decode_field(
+            f,
+            tuple(data[a] for a in range(f.address, f.last_address + 1)),
+        )
+        for f in group.fields
+    )
+
+
+@dataclass(frozen=True)
+class DeviceTarget:
+    """One device plus the groups to mirror off it at a barrier.
+
+    ``device`` must implement the history protocol (``read_at(seq,
+    start, count)``, ``pin``/``unpin``, ``resolve_barrier``,
+    ``retains``) and expose a positive int ``size`` -- as
+    :class:`~regmirror.device.HistoryDevice` does.
+    """
+
+    name: str
+    device: object
+    groups: tuple[RegisterGroup, ...]
+
+    def __init__(
+        self,
+        name: str,
+        device: object,
+        groups: Sequence[RegisterGroup],
+    ):
+        if not isinstance(name, str) or not name:
+            raise ConfigError(
+                f"device name must be a non-empty str, got {name!r}"
+            )
+        if device is None:
+            raise ConfigError(f"device target {name!r}: device is required")
+        groups = tuple(groups)
+        if not groups:
+            raise ConfigError(
+                f"device target {name!r}: at least one group required"
+            )
+        for g in groups:
+            if not isinstance(g, RegisterGroup):
+                raise ConfigError(
+                    f"device target {name!r}: groups must contain "
+                    f"RegisterGroup, got {type(g).__name__}"
+                )
+        names = [g.name for g in groups]
+        if len(set(names)) != len(names):
+            raise ConfigError(
+                f"device target {name!r}: duplicate group names "
+                f"{sorted(names)}"
+            )
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "device", device)
+        object.__setattr__(self, "groups", groups)
+
+
+@dataclass(frozen=True)
+class DeviceSnapshot:
+    """All groups of one device decoded from one pinned commit.
+
+    ``sequence`` is the sequence of the device's last commit at or
+    before the requested barrier.  The values are a frozen view of that
+    commit; later device commits cannot alter them.
+    """
+
+    name: str
+    sequence: int
+    groups: tuple[GroupSnapshot, ...]
+
+    def __getitem__(self, group_name: str) -> GroupSnapshot:
+        for g in self.groups:
+            if g.name == group_name:
+                return g
+        raise KeyError(group_name)
+
+    def __len__(self) -> int:
+        return len(self.groups)
+
+
+@dataclass(frozen=True)
+class Mirror:
+    """A complete cross-device barrier mirror: every device or nothing."""
+
+    barrier: int
+    devices: tuple[DeviceSnapshot, ...]
+
+    def __getitem__(self, device_name: str) -> DeviceSnapshot:
+        for d in self.devices:
+            if d.name == device_name:
+                return d
+        raise KeyError(device_name)
+
+    def __len__(self) -> int:
+        return len(self.devices)
+
+    @property
+    def sequences(self) -> dict[str, int]:
+        """Device name -> committed sequence served for the barrier."""
+        return {d.name: d.sequence for d in self.devices}
+
+
 class Scanner:
     """Scans register groups off a device image with the version gate."""
 
@@ -266,14 +385,149 @@ class Scanner:
                 addr += n
             v2 = self._read(device, group.version_address, 1)[0]
             if v1 == v2 and not (v1 & 1):
-                values = tuple(
-                    decode_field(
-                        f,
-                        tuple(data[a] for a in range(f.address, f.last_address + 1)),
-                    )
-                    for f in group.fields
-                )
+                values = _decode_group_data(group, data)
                 return GroupSnapshot(group.name, v1, _attempt, values)
             last_reason = InconsistentRead(group.name, v1, v2)
         assert last_reason is not None  # max_attempts >= 1
         raise InconsistentScanError(self.config.max_attempts, (last_reason,))
+
+    # -- barrier mirror --------------------------------------------------
+
+    def mirror(
+        self, targets: Sequence[DeviceTarget], barrier: int
+    ) -> Mirror:
+        """Return one cross-device mirror at ``barrier`` or raise.
+
+        For every target the device's *last commit with sequence <=
+        barrier* is selected and pinned; all of its groups are decoded
+        from that single frozen commit, so updates committed while the
+        mirror is being assembled can never mix into a field.  If any
+        device cannot serve the barrier (no commit yet, or the needed
+        commit was pruned), :class:`SnapshotUnavailableError` is raised
+        and no partial mirror is published.
+
+        All configuration is validated before any history access.
+        """
+        targets = self._validate_targets(targets, barrier)
+        resolved: list[tuple[DeviceTarget, int]] = []
+        pinned: list[tuple[object, int]] = []
+        try:
+            # Phase 1: resolve and pin before reading any data words.
+            for t in targets:
+                dev = t.device
+                try:
+                    seq = dev.resolve_barrier(barrier)
+                    dev.pin(seq)
+                except SnapshotUnavailableError as exc:
+                    raise SnapshotUnavailableError(
+                        t.name, barrier, exc.reason, exc.oldest
+                    ) from exc
+                pinned.append((dev, seq))
+                resolved.append((t, seq))
+            # Phase 2: decode every group from its pinned frozen commit.
+            device_snapshots: list[DeviceSnapshot] = []
+            for t, seq in resolved:
+                try:
+                    group_snapshots = tuple(
+                        self._read_historical_group(t.device, g, seq)
+                        for g in t.groups
+                    )
+                    # Defensive recheck: a conforming history device cannot
+                    # prune a pinned commit; a foreign one that does must
+                    # fail the whole mirror rather than publish half data.
+                    if not t.device.retains(seq):
+                        raise SnapshotUnavailableError(
+                            None, barrier, "history_pruned", None
+                        )
+                except SnapshotUnavailableError as exc:
+                    raise SnapshotUnavailableError(
+                        t.name, barrier, exc.reason, exc.oldest
+                    ) from exc
+                device_snapshots.append(
+                    DeviceSnapshot(t.name, seq, tuple(group_snapshots))
+                )
+        finally:
+            for dev, seq in pinned:
+                dev.unpin(seq)
+        return Mirror(barrier, tuple(device_snapshots))
+
+    def _read_historical_group(
+        self, device: object, group: RegisterGroup, seq: int
+    ) -> GroupSnapshot:
+        first, last = group.data_span
+        chunk = self.config.max_read_words
+        data: dict[int, int] = {}
+        addr = first
+        while addr <= last:
+            n = min(chunk, last - addr + 1)
+            words = check_read_result(
+                addr, n, device.read_at(seq, addr, n)
+            )
+            data.update(zip(range(addr, addr + n), words))
+            addr += n
+        version_word = check_read_result(
+            group.version_address,
+            1,
+            device.read_at(seq, group.version_address, 1),
+        )[0]
+        # attempts=0 marks a group served from pinned history without the
+        # live retry gate.
+        return GroupSnapshot(
+            group.name, version_word, 0, _decode_group_data(group, data)
+        )
+
+    def _validate_targets(
+        self, targets: Sequence[DeviceTarget], barrier: object
+    ) -> tuple[DeviceTarget, ...]:
+        if isinstance(targets, (str, bytes)) or not isinstance(
+            targets, Sequence
+        ):
+            raise ConfigError("targets must be a sequence of DeviceTarget")
+        targets = tuple(targets)
+        if not targets:
+            raise ConfigError("at least one device target is required")
+        for t in targets:
+            if not isinstance(t, DeviceTarget):
+                raise ConfigError(
+                    "targets must contain DeviceTarget, "
+                    f"got {type(t).__name__}"
+                )
+        names = [t.name for t in targets]
+        if len(set(names)) != len(names):
+            raise ConfigError(f"duplicate device names {sorted(names)}")
+        if isinstance(barrier, bool) or not isinstance(barrier, int):
+            raise ConfigError(
+                f"barrier must be an int, got {type(barrier).__name__}"
+            )
+        if barrier < 0:
+            raise ConfigError(f"barrier must be >= 0, got {barrier}")
+        for t in targets:
+            dev = t.device
+            for meth in ("read_at", "pin", "unpin", "resolve_barrier",
+                         "retains"):
+                if not callable(getattr(dev, meth, None)):
+                    raise ConfigError(
+                        f"device {t.name!r}: {type(dev).__name__} does not "
+                        f"provide history method {meth}()"
+                    )
+            size = getattr(dev, "size", None)
+            if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+                raise ConfigError(
+                    f"device {t.name!r}: must expose a positive int size, "
+                    f"got {size!r}"
+                )
+            for g in t.groups:
+                first, last = g.data_span
+                if last >= size:
+                    raise AddressError(
+                        f"device {t.name!r} group {g.name!r}: data "
+                        f"registers {first}..{last} outside image of "
+                        f"size {size}"
+                    )
+                if g.version_address >= size:
+                    raise AddressError(
+                        f"device {t.name!r} group {g.name!r}: version "
+                        f"register {g.version_address} outside image of "
+                        f"size {size}"
+                    )
+        return targets

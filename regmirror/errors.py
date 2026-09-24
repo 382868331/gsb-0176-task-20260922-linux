@@ -24,6 +24,7 @@ __all__ = [
     "DeviceReadError",
     "InconsistentRead",
     "InconsistentScanError",
+    "SnapshotUnavailableError",
 ]
 
 
@@ -86,4 +87,44 @@ class InconsistentScanError(RegMirrorError):
         detail = "; ".join(str(r) for r in self.reasons) or "no groups"
         super().__init__(
             f"snapshot inconsistent after {attempts} attempt(s): {detail}"
+        )
+
+
+class SnapshotUnavailableError(RegMirrorError):
+    """The requested barrier commit is not available from device history.
+
+    Raised by barrier mirror scans when a device has no commit at or
+    before the barrier (``reason="history_insufficient"``) or the commit
+    needed was pruned from the bounded history while the read was in
+    flight (``reason="history_pruned"``).  Both cases carry the stable
+    string :attr:`code` == ``"snapshot_unavailable"`` for callers that
+    branch on an error code rather than the exception type.
+
+    Attributes:
+        code:    stable error code, always ``"snapshot_unavailable"``.
+        device:  name/index of the failing device.
+        barrier: the requested barrier sequence number.
+        reason:  ``"history_insufficient"`` or ``"history_pruned"``.
+        oldest:  oldest sequence still retained at failure time (the
+                 device has no commit before its first retained one),
+                 or ``None`` if no history is retained at all.
+    """
+
+    code = "snapshot_unavailable"
+
+    def __init__(
+        self,
+        device: object,
+        barrier: int,
+        reason: str,
+        oldest: int | None = None,
+    ):
+        self.device = device
+        self.barrier = barrier
+        self.reason = reason
+        self.oldest = oldest
+        suffix = f"; oldest retained seq = {oldest}" if oldest is not None else ""
+        super().__init__(
+            f"device {device!r} cannot serve barrier {barrier} "
+            f"({reason}){suffix}"
         )
