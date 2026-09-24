@@ -1,7 +1,8 @@
 """Offline demo of the regmirror atomic scanner.
 
-Runs three real scans against a deterministic scripted device image:
+Runs five real scans against deterministic scripted device images:
 
+Single-device version-gated scanner:
 1. A clean scan that commits on the first attempt (normal result).
 2. A scan where the device rewrites a 64-bit field between two chunked
    reads -- the torn intermediate read is shown and discarded, the
@@ -9,20 +10,34 @@ Runs three real scans against a deterministic scripted device image:
 3. A device whose version register stays odd forever -- the scan
    actually raises InconsistentScanError (rejection boundary).
 
-Everything is computed live from the scripted image; no sleeps, no
-prerecorded output.  Expected runtime: well under 8 seconds.
+Barrier mirror across several history-keeping devices:
+4. Three devices commit at non-contiguous global seqs; a barrier mirror
+   returns each device's last commit at or before the barrier -- one
+   served from immutable history (zero device reads), two live.
+5. A barrier older than retained history -> snapshot_unavailable, and a
+   bus fault on one device -> the whole mirror is withheld.
+
+Everything is computed live from the scripted images; no sleeps, no
+prerecorded output.  Expected runtime: well under a second.
 """
 
 from fractions import Fraction
 
 from regmirror import (
     Change,
+    DeviceCommit,
+    DeviceReadError,
     DeviceMirror,
     FieldSpec,
+    HistoricalDevice,
     InconsistentScanError,
+    MirrorRequest,
+    MirrorScanner,
+    MultiDeviceReadError,
     RegisterGroup,
     ScanConfig,
     Scanner,
+    SnapshotUnavailableError,
     decode_field,
 )
 
@@ -48,6 +63,11 @@ def image(version):
     regs = dict(enumerate(ENERGY_V1 + TEMP_V1))
     regs[6] = version
     return regs
+
+
+def image_data():
+    # Data words only; HistoricalDevice takes the version separately.
+    return dict(enumerate(ENERGY_V1 + TEMP_V1))
 
 
 def show_snapshot(snap):
@@ -134,8 +154,88 @@ def main():
         raise AssertionError("expected InconsistentScanError")
 
     print()
+    print("=== 4. Barrier mirror across three history-keeping devices ===")
+    # Global commit timeline (non-contiguous seqs are deliberate):
+    #   A: seq1 V1/v2, seq5 V2/v4, seq9 V1/v6
+    #   B: seq2 V1/v2 (no further commits)
+    #   C: seq3 V1/v0, seq7 V2/v2
+    # Barrier 6 picks A@5 and C@3 (both sealed history), B@2 (live).
+    a = HistoricalDevice(
+        "boiler-A", 16, 6, initial_version=2, initial=image_data(),
+        start_seq=1,
+        script=[
+            DeviceCommit.at(4, [Change.set_words(0, ENERGY_V2 + TEMP_V2)], seq=5),
+            DeviceCommit.at(6, [Change.set_words(0, ENERGY_V1 + TEMP_V1)], seq=9),
+        ],
+    )
+    b = HistoricalDevice("boiler-B", 16, 6, initial_version=2,
+                         initial=image_data(), start_seq=2)
+    c = HistoricalDevice("boiler-C", 16, 6, initial_version=0,
+                         initial=image_data(), start_seq=3,
+                         script=[DeviceCommit.at(
+                             2, [Change.set_words(0, ENERGY_V2 + TEMP_V2)], seq=7)])
+    # Advance the scripts so A holds commits 1/5/9 and C holds 3/7.
+    a.read(0, 1)
+    a.read(0, 1)
+    c.read(0, 1)
+    reads_a_before = a.read_count
+    devices = {"boiler-A": a, "boiler-B": b, "boiler-C": c}
+    groups = {dev_id: GROUP for dev_id in devices}
+    req = MirrorRequest("plant-snapshot", barrier=6,
+                        devices=devices, groups=groups)
+    mirror = MirrorScanner(ScanConfig(max_read_words=2)).snapshot_at(req)
+    print(f"  mirror {mirror.name!r} barrier={mirror.barrier} "
+          f"status={mirror.status}")
+    for d in mirror.devices:
+        fields = ", ".join(f"{v.name}={v.raw:#x}" for v in d.values)
+        print(
+            f"  {d.device_id:<9} seq={d.seq} version={d.version:<2} "
+            f"source={d.source:<7} attempts={d.attempts}  {fields}"
+        )
+    print(f"  boiler-A added {a.read_count - reads_a_before} device reads "
+          "(sealed commit decoded from immutable history)")
+    assert mirror["boiler-A"].seq == 5 and mirror["boiler-A"].source == "history"
+    assert mirror["boiler-B"]["energy"].raw == 0x0102030405060708
+    assert mirror["boiler-C"]["energy"].raw == 0x0102030405060708
+
+    print()
+    print("=== 5a. Barrier older than retained history: snapshot_unavailable ===")
+    # This device's oldest retained commit is seq 10; barrier 5 cannot
+    # be served.  The error is raised before any device read.
+    late = HistoricalDevice("late-device", 16, 6, initial_version=0,
+                            initial=image_data(), start_seq=10)
+    req = MirrorRequest("m", 5, {"late-device": late},
+                        {"late-device": GROUP})
+    try:
+        MirrorScanner().snapshot_at(req)
+    except SnapshotUnavailableError as exc:
+        print(f"  status={exc.status}: {exc}")
+        print(f"  reads served: {late.read_count} (history checked locally)")
+    else:
+        raise AssertionError("expected SnapshotUnavailableError")
+
+    print()
+    print("=== 5b. One device bus fault: no partial mirror published ===")
+    good = HistoricalDevice("good", 16, 6, initial_version=2,
+                            initial=image_data(), start_seq=1)
+    faulty = HistoricalDevice(
+        "faulty", 16, 6, initial_version=2, initial=image_data(), start_seq=1,
+        faults={0: DeviceReadError("simulated bus fault on read 0")},
+    )
+    req = MirrorRequest("m", 5, {"good": good, "faulty": faulty},
+                        {"good": GROUP, "faulty": GROUP})
+    try:
+        MirrorScanner(ScanConfig(max_read_words=2)).snapshot_at(req)
+    except MultiDeviceReadError as exc:
+        print(f"  status={exc.status}: {exc}")
+        print("  no MirrorSnapshot returned; error carries diagnostics only")
+    else:
+        raise AssertionError("expected MultiDeviceReadError")
+
+    print()
     print("demo finished: 1 committed snapshot, 1 torn read discarded,")
-    print("1 rejection boundary raised -- all computed live.")
+    print("1 rejection boundary, 1 barrier mirror, snapshot_unavailable and")
+    print("a real device-read fault -- all computed live.")
 
 
 if __name__ == "__main__":

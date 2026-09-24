@@ -24,6 +24,12 @@ __all__ = [
     "DeviceReadError",
     "InconsistentRead",
     "InconsistentScanError",
+    "SnapshotUnavailableError",
+    "MissingHistory",
+    "MultiDeviceReadError",
+    "DeviceFailure",
+    "InconsistentMirrorScanError",
+    "DeviceInconsistency",
 ]
 
 
@@ -87,3 +93,107 @@ class InconsistentScanError(RegMirrorError):
         super().__init__(
             f"snapshot inconsistent after {attempts} attempt(s): {detail}"
         )
+
+
+@dataclass(frozen=True)
+class MissingHistory:
+    """Diagnostic for one device whose history does not reach a barrier.
+
+    Like :class:`InconsistentRead`, it carries no field data -- only the
+    requested barrier and the oldest sequence number the device retains.
+    """
+
+    device_id: str
+    barrier: int
+    oldest_seq: int
+
+    def __str__(self) -> str:
+        return (
+            f"device {self.device_id!r}: no commit at or before barrier "
+            f"{self.barrier} (oldest retained seq {self.oldest_seq})"
+        )
+
+
+class SnapshotUnavailableError(RegMirrorError):
+    """``snapshot_unavailable``: the requested barrier predates retained
+    history for at least one device.
+
+    This is distinct from :class:`InconsistentScanError` (a live read that
+    never stabilised) and from :class:`ConfigError` (an impossible
+    request): the *barrier itself* is valid, but the bounded history no
+    longer contains a commit that old.  No mirror is published.
+
+    Attributes:
+        barrier: the requested barrier.
+        missing: one :class:`MissingHistory` per device with too-short
+                 history.
+    """
+
+    #: Stable machine-readable status string (documented in the README).
+    status = "snapshot_unavailable"
+
+    def __init__(self, barrier: int, missing: tuple[MissingHistory, ...]):
+        self.barrier = barrier
+        self.missing = tuple(missing)
+        detail = "; ".join(str(m) for m in self.missing) or "no devices"
+        super().__init__(
+            f"snapshot_unavailable at barrier {barrier}: {detail}"
+        )
+
+
+@dataclass(frozen=True)
+class DeviceFailure:
+    """One device whose ``read`` violated its contract during a mirror scan."""
+
+    device_id: str
+    error: DeviceReadError
+
+    def __str__(self) -> str:
+        return f"device {self.device_id!r}: {self.error}"
+
+
+@dataclass(frozen=True)
+class DeviceInconsistency:
+    """One device whose live read never passed the version gate."""
+
+    device_id: str
+    attempts: int
+    reason: InconsistentRead
+
+    def __str__(self) -> str:
+        return (
+            f"device {self.device_id!r}: inconsistent after {self.attempts} "
+            f"attempt(s) ({self.reason})"
+        )
+
+
+class MultiDeviceReadError(RegMirrorError):
+    """One or more devices violated the ``read`` contract during a mirror.
+
+    Attributes:
+        failures: one :class:`DeviceFailure` per failing device.
+    """
+
+    #: Stable machine-readable status string (documented in the README).
+    status = "device_read_error"
+
+    def __init__(self, failures: tuple[DeviceFailure, ...]):
+        self.failures = tuple(failures)
+        detail = "; ".join(str(f) for f in self.failures)
+        super().__init__(f"device read failure(s): {detail}")
+
+
+class InconsistentMirrorScanError(RegMirrorError):
+    """At least one device exhausted its retry budget during a mirror.
+
+    Attributes:
+        failures: one :class:`DeviceInconsistency` per failing device.
+    """
+
+    #: Stable machine-readable status string (documented in the README).
+    status = "mirror_inconsistent"
+
+    def __init__(self, failures: tuple[DeviceInconsistency, ...]):
+        self.failures = tuple(failures)
+        detail = "; ".join(str(f) for f in self.failures)
+        super().__init__(f"mirror inconsistent: {detail}")
