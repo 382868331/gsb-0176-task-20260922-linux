@@ -19,6 +19,13 @@ from .errors import (
     RegMirrorError,
 )
 from .fields import FieldSpec, FieldValue, decode_field, encode_field
+from .planner import (
+    ReadBlock,
+    ReadPlan,
+    check_read_plan,
+    normalize_intervals,
+    plan_reads,
+)
 from .scanner import (
     MAX_COMMITS_PER_SCAN,
     GroupSnapshot,
@@ -28,7 +35,7 @@ from .scanner import (
     Snapshot,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "AddressError",
@@ -42,12 +49,17 @@ __all__ = [
     "InconsistentRead",
     "InconsistentScanError",
     "MAX_COMMITS_PER_SCAN",
+    "ReadBlock",
+    "ReadPlan",
     "RegisterGroup",
     "RegMirrorError",
     "ScanConfig",
     "Scanner",
     "Snapshot",
+    "check_read_plan",
     "decode_field",
     "encode_field",
+    "normalize_intervals",
+    "plan_reads",
     "__version__",
 ]

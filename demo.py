@@ -1,6 +1,6 @@
 """Offline demo of the regmirror atomic scanner.
 
-Runs three real scans against a deterministic scripted device image:
+Runs real scans against deterministic scripted device images:
 
 1. A clean scan that commits on the first attempt (normal result).
 2. A scan where the device rewrites a 64-bit field between two chunked
@@ -8,15 +8,20 @@ Runs three real scans against a deterministic scripted device image:
    retry commits the consistent state.
 3. A device whose version register stays odd forever -- the scan
    actually raises InconsistentScanError (rejection boundary).
+4. The inspectable read planner: overlapping/gapped fields merged into
+   minimal blocks, a forbidden hole splitting the plan, and the
+   "impossible by construction" boundary (a required register inside a
+   forbidden range -> ConfigError, before any device read).
 
 Everything is computed live from the scripted image; no sleeps, no
-prerecorded output.  Expected runtime: well under 8 seconds.
+prerecorded output.  Expected runtime: well under 90 seconds.
 """
 
 from fractions import Fraction
 
 from regmirror import (
     Change,
+    ConfigError,
     DeviceMirror,
     FieldSpec,
     InconsistentScanError,
@@ -134,8 +139,84 @@ def main():
         raise AssertionError("expected InconsistentScanError")
 
     print()
+    print("=== 4. Read planner: overlaps, short gap, forbidden hole ===")
+    # Two layouts, image size 16, version register at 8:
+    #   group "ov": u64 both@0..3, u32 a@0..1 (overlap), u32 b@4..5
+    #               -> occupied registers 0..5 (contiguous)
+    #   group "gap": u32 a@0..1, u32 b@4..5 -> occupied 0..1,4..5
+    #               with a 2-register gap (2,3) between them
+    ov = RegisterGroup(
+        "ov", version_address=8,
+        fields=(
+            FieldSpec("both", 0, width=64),
+            FieldSpec("a", 0, width=32),
+            FieldSpec("b", 4, width=32),
+        ),
+    )
+    gap = RegisterGroup(
+        "gap", version_address=8,
+        fields=(FieldSpec("a", 0, width=32), FieldSpec("b", 4, width=32)),
+    )
+    initial = {0: 0x01, 1: 0x02, 2: 0x03, 3: 0x04,
+               4: 0x05, 5: 0x06, 8: 2}
+
+    def show_plan(title, group_, cfg):
+        dev = DeviceMirror(16, initial=initial)
+        plan = Scanner(cfg).plan_scan(dev, [group_])[group_.name]
+        blocks = [(blk.start, blk.count) for blk in plan.blocks]
+        print(f"  {title}")
+        print(f"    blocks(start,count) = {blocks}")
+        print(f"    data reads/attempt = {plan.read_count}, "
+              f"extra registers = {plan.extra_registers}")
+        plan.check()
+        return dev
+
+    # Overlapping fields: their occupied registers merge to 0..5, so one
+    # block of 6 words reads everything, each shared register once.
+    dev = show_plan(
+        "overlapping fields (cap=8):", ov, ScanConfig(max_read_words=8)
+    )
+    snap = Scanner(ScanConfig(max_read_words=8)).scan(dev, [ov])
+    print(f"    committed: both={snap['ov']['both'].raw:#018x}, "
+          f"a={snap['ov']['a'].raw:#010x}, b={snap['ov']['b'].raw:#010x}")
+
+    # Short gap: max_gap_words=2 allows bridging registers 2,3 in one
+    # data read (2 extra registers); max_gap_words=0 forces two blocks.
+    show_plan(
+        "gap bridged (cap=8, max_gap_words=2):",
+        gap, ScanConfig(max_read_words=8, max_gap_words=2),
+    )
+    show_plan(
+        "gap not bridged (cap=8, max_gap_words=0):",
+        gap, ScanConfig(max_read_words=8, max_gap_words=0),
+    )
+
+    # Forbidden hole 2..3: even when bridging is otherwise allowed, no
+    # block may touch the hole, so the plan splits around it.
+    show_plan(
+        "forbidden hole 2..3 (cap=8, max_gap_words=2):",
+        gap,
+        ScanConfig(max_read_words=8, max_gap_words=2,
+                   forbidden_ranges=[(2, 3)]),
+    )
+
+    # Boundary actually triggered: forbid a register a field occupies.
+    # No legal plan exists -> ConfigError, before any device read.
+    dev = DeviceMirror(16, initial=initial)
+    bad_cfg = ScanConfig(forbidden_ranges=[(3, 3)])  # 3 is in "both"
+    try:
+        Scanner(bad_cfg).scan(dev, [ov])
+    except ConfigError as exc:
+        print(f"  impossible boundary -> ConfigError: {exc}")
+        print(f"    device reads attempted: {dev.read_count} (must be 0)")
+    else:
+        raise AssertionError("expected ConfigError")
+    assert dev.read_count == 0
+
+    print()
     print("demo finished: 1 committed snapshot, 1 torn read discarded,")
-    print("1 rejection boundary raised -- all computed live.")
+    print("1 rejection boundary, planner overlap/gap/hole/impossible --")
+    print("all computed live.")
 
 
 if __name__ == "__main__":

@@ -210,12 +210,22 @@ class TestValidationBeforeAnyRead(unittest.TestCase):
             Scanner().scan(dev, [bad_group])
         self.assertEqual(dev.read_count, 0)
 
-    def test_overlapping_fields_rejected(self):
-        with self.assertRaises(ConfigError):
-            RegisterGroup(
-                "g", 10,
-                fields=(FieldSpec("a", 0, width=64), FieldSpec("b", 2)),
-            )
+    def test_overlapping_fields_accepted_and_merged(self):
+        # Contract changed with the read planner: overlapping fields are
+        # legal; their shared registers are merged and read once.
+        g = RegisterGroup(
+            "g", 10,
+            fields=(FieldSpec("a", 0, width=64), FieldSpec("b", 2)),
+        )
+        self.assertEqual(g.required_intervals, ((0, 3),))
+        dev = DeviceMirror(16, initial={0: 1, 1: 2, 2: 3, 3: 4, 10: 2})
+        plan = Scanner(ScanConfig(max_read_words=4)).plan_scan(dev, [g])["g"]
+        self.assertEqual(
+            [(b.start, b.count) for b in plan.blocks], [(0, 4)]
+        )
+        snap = Scanner().scan(dev, [g])
+        self.assertEqual(snap["g"]["a"].raw, 0x0001000200030004)
+        self.assertEqual(snap["g"]["b"].raw, 0x00030004)
 
     def test_version_overlap_rejected(self):
         with self.assertRaises(ConfigError):

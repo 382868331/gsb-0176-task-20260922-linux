@@ -35,6 +35,7 @@ from .errors import (
     InconsistentScanError,
 )
 from .fields import FieldSpec, FieldValue, decode_field
+from .planner import ReadPlan, normalize_intervals, plan_reads
 
 __all__ = [
     "MAX_COMMITS_PER_SCAN",
@@ -60,7 +61,14 @@ def _check_int(name: str, value: object) -> int:
 
 @dataclass(frozen=True)
 class RegisterGroup:
-    """A named set of fields guarded by one 16-bit version register."""
+    """A named set of fields guarded by one 16-bit version register.
+
+    Fields may overlap in their register ranges (e.g. a 64-bit and a
+    32-bit view of the same registers); overlapping ranges are merged
+    into the required register set when planning reads.  Fields may
+    never cover the group's version register, and field names must be
+    unique within the group.
+    """
 
     name: str
     version_address: int
@@ -96,15 +104,8 @@ class RegisterGroup:
             raise ConfigError(
                 f"group {name!r}: duplicate field names {sorted(names)}"
             )
-        # Reject overlapping register ranges instead of silently decoding
-        # ambiguous data.
-        spans = sorted((f.address, f.last_address, f.name) for f in fields)
-        for (lo1, hi1, n1), (lo2, hi2, n2) in zip(spans, spans[1:]):
-            if lo2 <= hi1:
-                raise ConfigError(
-                    f"group {name!r}: fields {n1!r} and {n2!r} overlap "
-                    f"at register {lo2}"
-                )
+        # Overlapping fields are allowed: the planner merges their
+        # register ranges, so each shared register is read exactly once.
         for f in fields:
             if f.address <= version_address <= f.last_address:
                 raise ConfigError(
@@ -123,13 +124,41 @@ class RegisterGroup:
             max(f.last_address for f in self.fields),
         )
 
+    @property
+    def required_intervals(self) -> tuple[tuple[int, int], ...]:
+        """Merged inclusive register intervals the fields occupy.
+
+        Overlapping field ranges coalesce, so the result has neither
+        overlaps nor adjacency gaps; the planner plans exactly these.
+        """
+        return normalize_intervals(
+            f"group {self.name!r} fields",
+            tuple((f.address, f.last_address) for f in self.fields),
+        )
+
 
 @dataclass(frozen=True)
 class ScanConfig:
-    """Tuning for one scan run."""
+    """Tuning for one scan run.
+
+    Parameters:
+        max_attempts:     total attempts per group before giving up.
+        max_read_words:   maximum registers one ``read`` may return.
+        max_gap_words:    maximum run of *extra* (non-field) registers a
+                          data block may bridge between field registers.
+        forbidden_ranges: inclusive ``(start, end)`` ranges no data block
+                          may touch; a group whose fields need such a
+                          register is rejected with :class:`ConfigError`
+                          before any device read.  A group's own version
+                          register is forbidden for its data blocks
+                          automatically -- the version check is never
+                          folded into a data block.
+    """
 
     max_attempts: int = 4
     max_read_words: int = 16
+    max_gap_words: int = 0
+    forbidden_ranges: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         max_attempts = _check_int("max_attempts", self.max_attempts)
@@ -142,6 +171,13 @@ class ScanConfig:
             raise ConfigError(
                 f"max_read_words must be in 1..65536, got {max_read_words}"
             )
+        max_gap_words = _check_int("max_gap_words", self.max_gap_words)
+        if not 0 <= max_gap_words <= 65535:
+            raise ConfigError(
+                f"max_gap_words must be in 0..65535, got {max_gap_words}"
+            )
+        forbidden = normalize_intervals("forbidden_ranges", self.forbidden_ranges)
+        object.__setattr__(self, "forbidden_ranges", forbidden)
 
 
 @dataclass(frozen=True)
@@ -194,20 +230,34 @@ class Scanner:
         """Return a complete snapshot or raise InconsistentScanError.
 
         ``device`` must provide ``read(start, count)`` and ``size``.
-        All configuration is validated before the first device read, so
-        a misconfigured scan never touches the device.
+        All configuration is validated -- including the read plan --
+        before the first device read, so a misconfigured scan never
+        touches the device.
         """
-        groups = self._validate(device, groups)
+        groups, plans = self._validate(device, groups)
         committed: list[GroupSnapshot] = []
         for group in groups:
-            committed.append(self._scan_group(device, group))
+            committed.append(self._scan_group(device, group, plans[group.name]))
         return Snapshot(tuple(committed))
+
+    def plan_scan(
+        self, device: object, groups: Sequence[RegisterGroup]
+    ) -> dict[str, ReadPlan]:
+        """Build and verify the per-group read plans without reading.
+
+        Returns ``{group_name: ReadPlan}``.  Raises :class:`ConfigError`
+        (or :class:`AddressError`) for invalid configuration; performs
+        no device reads.  Plans are built per group -- blocks never span
+        groups -- and every plan is independently re-checked.
+        """
+        groups, plans = self._validate(device, groups)
+        return {g.name: plans[g.name] for g in groups}
 
     # -- internals ------------------------------------------------------
 
     def _validate(
         self, device: object, groups: Sequence[RegisterGroup]
-    ) -> tuple[RegisterGroup, ...]:
+    ) -> tuple[tuple[RegisterGroup, ...], dict[str, ReadPlan]]:
         if isinstance(groups, (str, bytes)) or not isinstance(groups, Sequence):
             raise ConfigError("groups must be a sequence of RegisterGroup")
         groups = tuple(groups)
@@ -232,6 +282,7 @@ class Scanner:
             raise ConfigError(
                 f"device must expose a positive int size, got {size!r}"
             )
+        plans: dict[str, ReadPlan] = {}
         for g in groups:
             first, last = g.data_span
             if last >= size:
@@ -244,26 +295,54 @@ class Scanner:
                     f"group {g.name!r}: version register "
                     f"{g.version_address} outside device image of size {size}"
                 )
-        return groups
+            # The version register may never be part of a data block:
+            # the version check is its own read, before and after the
+            # data blocks, on every attempt.
+            forbidden = tuple(self.config.forbidden_ranges) + (
+                (g.version_address, g.version_address),
+            )
+            plan = plan_reads(
+                g.required_intervals,
+                max_read_words=self.config.max_read_words,
+                max_gap_words=self.config.max_gap_words,
+                forbidden=forbidden,
+            )
+            # Independent re-check of the constructed plan before use.
+            plan.check()
+            for block in plan.blocks:
+                if block.last >= size:
+                    raise AddressError(
+                        f"group {g.name!r}: planned read "
+                        f"{block.start}..{block.last} outside device "
+                        f"image of size {size}"
+                    )
+            plans[g.name] = plan
+        return groups, plans
 
     def _read(self, device: object, start: int, count: int) -> tuple[int, ...]:
         return check_read_result(start, count, device.read(start, count))
 
     def _scan_group(
-        self, device: object, group: RegisterGroup
+        self,
+        device: object,
+        group: RegisterGroup,
+        plan: ReadPlan,
     ) -> GroupSnapshot:
-        first, last = group.data_span
-        chunk = self.config.max_read_words
+        # The plan is fixed for all attempts: a failed attempt is thrown
+        # away completely and the group is retried with the same blocks,
+        # never reusing partial blocks from the previous attempt.
         last_reason: InconsistentRead | None = None
         for _attempt in range(1, self.config.max_attempts + 1):
             v1 = self._read(device, group.version_address, 1)[0]
             data: dict[int, int] = {}
-            addr = first
-            while addr <= last:
-                n = min(chunk, last - addr + 1)
-                words = self._read(device, addr, n)
-                data.update(zip(range(addr, addr + n), words))
-                addr += n
+            for block in plan.blocks:
+                words = self._read(device, block.start, block.count)
+                data.update(
+                    zip(
+                        range(block.start, block.start + block.count),
+                        words,
+                    )
+                )
             v2 = self._read(device, group.version_address, 1)[0]
             if v1 == v2 and not (v1 & 1):
                 values = tuple(
