@@ -6,13 +6,20 @@ Protocol (fixed public contract):
   **odd** while writing the group's data registers and **even** when the
   group is stable again.  Every committed write increments the version
   by 2 (mod 2**16), so versions wrap around.
-* One attempt = read version, read the data registers in chunks of at
-  most ``ScanConfig.max_read_words``, read version again.  The attempt
-  commits iff both version words are equal and even.
+* One attempt = read version, read the group's data registers using the
+  precomputed :class:`~regmirror.planner.GroupPlan` (a minimum number of
+  reads of at most ``ScanConfig.max_read_words`` words each, bridging at
+  most ``ScanConfig.max_gap_words`` extra registers and never touching
+  the group's ``forbidden_ranges``), read version again.  The attempt
+  commits iff both version words are equal and even.  Version reads are
+  always separate singleton reads -- the version check is never merged
+  into a data block.
 * Failed attempts are retried up to ``max_attempts`` in total; then
-  :class:`InconsistentScanError` is raised.  The exception carries only
-  diagnostic version words — never decoded field data — so a failed
-  scan yields a complete snapshot or no values at all.
+  :class:`InconsistentScanError` is raised.  On failure the whole group
+  is retried using the same plan from the beginning; blocks read on the
+  failed attempt are never reused.  The exception carries only diagnostic
+  version words — never decoded field data — so a failed scan yields a
+  complete snapshot or no values at all.
 
 Version-wraparound contract: because the version is 16-bit and advances
 by 2 per commit, equal even versions guarantee "no commit happened"
@@ -35,6 +42,12 @@ from .errors import (
     InconsistentScanError,
 )
 from .fields import FieldSpec, FieldValue, decode_field
+from .planner import (
+    GroupPlan,
+    ScanPlan,
+    normalize_forbidden_ranges,
+    plan_group,
+)
 
 __all__ = [
     "MAX_COMMITS_PER_SCAN",
@@ -60,17 +73,29 @@ def _check_int(name: str, value: object) -> int:
 
 @dataclass(frozen=True)
 class RegisterGroup:
-    """A named set of fields guarded by one 16-bit version register."""
+    """A named set of fields guarded by one 16-bit version register.
+
+    Fields are non-overlapping by default; pass ``allow_overlap=True`` to
+    deliberately group fields that share registers (the planner covers the
+    union of their registers exactly once).  ``forbidden_ranges`` declares
+    half-open ``[start, end)`` intervals this group's reads must never
+    touch -- an empty tuple means nothing is off-limits.
+    """
 
     name: str
     version_address: int
     fields: tuple[FieldSpec, ...]
+    allow_overlap: bool = False
+    forbidden_ranges: tuple[tuple[int, int], ...] = ()
 
     def __init__(
         self,
         name: str,
         version_address: int,
         fields: Sequence[FieldSpec],
+        *,
+        allow_overlap: bool = False,
+        forbidden_ranges: Sequence[tuple[int, int]] = (),
     ):
         if not isinstance(name, str) or not name:
             raise ConfigError(
@@ -96,15 +121,21 @@ class RegisterGroup:
             raise ConfigError(
                 f"group {name!r}: duplicate field names {sorted(names)}"
             )
-        # Reject overlapping register ranges instead of silently decoding
-        # ambiguous data.
+        if not isinstance(allow_overlap, bool):
+            raise ConfigError(
+                f"group {name!r}: allow_overlap must be a bool, "
+                f"got {type(allow_overlap).__name__}"
+            )
+        # Reject overlapping register ranges unless the caller explicitly
+        # opts in; without the flag ambiguous data is a configuration bug.
         spans = sorted((f.address, f.last_address, f.name) for f in fields)
         for (lo1, hi1, n1), (lo2, hi2, n2) in zip(spans, spans[1:]):
-            if lo2 <= hi1:
+            if lo2 <= hi1 and not allow_overlap:
                 raise ConfigError(
                     f"group {name!r}: fields {n1!r} and {n2!r} overlap "
                     f"at register {lo2}"
                 )
+        forbidden = normalize_forbidden_ranges(forbidden_ranges)
         for f in fields:
             if f.address <= version_address <= f.last_address:
                 raise ConfigError(
@@ -114,6 +145,8 @@ class RegisterGroup:
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "version_address", version_address)
         object.__setattr__(self, "fields", fields)
+        object.__setattr__(self, "allow_overlap", allow_overlap)
+        object.__setattr__(self, "forbidden_ranges", forbidden)
 
     @property
     def data_span(self) -> tuple[int, int]:
@@ -126,10 +159,17 @@ class RegisterGroup:
 
 @dataclass(frozen=True)
 class ScanConfig:
-    """Tuning for one scan run."""
+    """Tuning for one scan run.
+
+    ``max_gap_words`` caps how many *extra* (non-field) registers a single
+    data read may span to merge neighbouring fields; the default 65535
+    preserves the legacy behaviour ("merge across any gap as long as the
+    block fits in ``max_read_words``").
+    """
 
     max_attempts: int = 4
     max_read_words: int = 16
+    max_gap_words: int = 65535
 
     def __post_init__(self) -> None:
         max_attempts = _check_int("max_attempts", self.max_attempts)
@@ -141,6 +181,11 @@ class ScanConfig:
         if not 1 <= max_read_words <= 65536:
             raise ConfigError(
                 f"max_read_words must be in 1..65536, got {max_read_words}"
+            )
+        max_gap_words = _check_int("max_gap_words", self.max_gap_words)
+        if not 0 <= max_gap_words <= 65535:
+            raise ConfigError(
+                f"max_gap_words must be in 0..65535, got {max_gap_words}"
             )
 
 
@@ -194,14 +239,60 @@ class Scanner:
         """Return a complete snapshot or raise InconsistentScanError.
 
         ``device`` must provide ``read(start, count)`` and ``size``.
-        All configuration is validated before the first device read, so
-        a misconfigured scan never touches the device.
+        All configuration is validated -- and the read plan is built --
+        before the first device read, so a misconfigured scan never
+        touches the device.
         """
         groups = self._validate(device, groups)
+        # Build the whole plan up front: an impossible layout (field in
+        # a forbidden hole, span larger than max_read_words, ...) is a
+        # ConfigError and must not cost a single device read.
+        scan_plan = self.build_plan(device, groups)
         committed: list[GroupSnapshot] = []
-        for group in groups:
-            committed.append(self._scan_group(device, group))
+        for group, plan in zip(groups, scan_plan.groups):
+            committed.append(self._scan_group(device, group, plan))
         return Snapshot(tuple(committed))
+
+    def build_plan(
+        self, device: object, groups: Sequence[RegisterGroup]
+    ) -> ScanPlan:
+        """Return the read plan this scanner would execute.
+
+        Pure planning: never calls ``device.read``.  Inspecting the plan
+        is the supported way to see how many data reads each group gets
+        and which extra registers get pulled in to merge fields; each
+        group's own ``forbidden_ranges`` are honoured.
+        """
+        groups = tuple(groups)
+        if isinstance(groups, (str, bytes)) or not isinstance(groups, Sequence):
+            raise ConfigError("groups must be a sequence of RegisterGroup")
+        if not groups:
+            raise ConfigError("at least one group is required")
+        for g in groups:
+            if not isinstance(g, RegisterGroup):
+                raise ConfigError(
+                    f"groups must contain RegisterGroup, got {type(g).__name__}"
+                )
+        names = [g.name for g in groups]
+        if len(set(names)) != len(names):
+            raise ConfigError(f"duplicate group names {sorted(names)}")
+        size = getattr(device, "size", None)
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise ConfigError(
+                f"device must expose a positive int size, got {size!r}"
+            )
+        return ScanPlan(
+            tuple(
+                plan_group(
+                    g,
+                    size=size,
+                    max_read_words=self.config.max_read_words,
+                    max_gap_words=self.config.max_gap_words,
+                    forbidden_ranges=g.forbidden_ranges,
+                )
+                for g in groups
+            )
+        )
 
     # -- internals ------------------------------------------------------
 
@@ -250,30 +341,40 @@ class Scanner:
         return check_read_result(start, count, device.read(start, count))
 
     def _scan_group(
-        self, device: object, group: RegisterGroup
+        self,
+        device: object,
+        group: RegisterGroup,
+        plan: GroupPlan,
     ) -> GroupSnapshot:
-        first, last = group.data_span
-        chunk = self.config.max_read_words
         last_reason: InconsistentRead | None = None
-        for _attempt in range(1, self.config.max_attempts + 1):
+        for attempt in range(1, self.config.max_attempts + 1):
+            # Every attempt executes the same fixed plan from scratch:
+            # version read, all planned data blocks in ascending order,
+            # version read.  A failed attempt is discarded wholesale --
+            # blocks from a previous attempt are never reused.
             v1 = self._read(device, group.version_address, 1)[0]
             data: dict[int, int] = {}
-            addr = first
-            while addr <= last:
-                n = min(chunk, last - addr + 1)
-                words = self._read(device, addr, n)
-                data.update(zip(range(addr, addr + n), words))
-                addr += n
+            for block in plan.blocks:
+                words = self._read(device, block.start, block.count)
+                data.update(
+                    zip(
+                        range(block.start, block.start + block.count),
+                        words,
+                    )
+                )
             v2 = self._read(device, group.version_address, 1)[0]
             if v1 == v2 and not (v1 & 1):
                 values = tuple(
                     decode_field(
                         f,
-                        tuple(data[a] for a in range(f.address, f.last_address + 1)),
+                        tuple(
+                            data[a]
+                            for a in range(f.address, f.last_address + 1)
+                        ),
                     )
                     for f in group.fields
                 )
-                return GroupSnapshot(group.name, v1, _attempt, values)
+                return GroupSnapshot(group.name, v1, attempt, values)
             last_reason = InconsistentRead(group.name, v1, v2)
         assert last_reason is not None  # max_attempts >= 1
         raise InconsistentScanError(self.config.max_attempts, (last_reason,))

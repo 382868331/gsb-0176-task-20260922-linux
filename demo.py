@@ -1,19 +1,19 @@
-"""Offline demo of the regmirror atomic scanner.
+"""Offline demo of the regmirror atomic scanner with read planning.
 
-Runs three real scans against a deterministic scripted device image:
+Everything is computed live against the deterministic scripted
+``DeviceMirror`` (no sleeps, no prerecorded output; well under 90 s):
 
-1. A clean scan that commits on the first attempt (normal result).
-2. A scan where the device rewrites a 64-bit field between two chunked
-   reads -- the torn intermediate read is shown and discarded, the
-   retry commits the consistent state.
-3. A device whose version register stays odd forever -- the scan
-   actually raises InconsistentScanError (rejection boundary).
-
-Everything is computed live from the scripted image; no sleeps, no
-prerecorded output.  Expected runtime: well under 8 seconds.
+1. Inspectable plan: fields that overlap and sit close together are
+   covered by fewer reads; the plan (blocks, read count, extra words) is
+   printed before the scan, and a read log proves the device was touched
+   exactly as planned.
+2. Forbidden hole: a banned interval splits one block into two; a
+   guarded image raises if any read enters the hole; the scanner also
+   survives a device commit mid-attempt by re-running the *same* plan
+   without reusing the failed attempt's partial blocks.
+3. Rejection boundary: a version register stuck odd makes every attempt
+   fail the gate, so ``InconsistentScanError`` is actually raised.
 """
-
-from fractions import Fraction
 
 from regmirror import (
     Change,
@@ -23,43 +23,7 @@ from regmirror import (
     RegisterGroup,
     ScanConfig,
     Scanner,
-    decode_field,
 )
-
-# Register map (image size 16):
-#   0..3  energy  u64, word big / byte big
-#   4..5  temp    s32, word little / byte big, scale 1/10 (decidegrees)
-#   6     version register (odd = device writing, even = stable)
-ENERGY = FieldSpec("energy", 0, width=64)
-TEMP = FieldSpec(
-    "temp", 4, width=32, signed=True, word_order="little",
-    scale=Fraction(1, 10),
-)
-GROUP = RegisterGroup("boiler", version_address=6, fields=(ENERGY, TEMP))
-
-# Hand-computed register images (see README for the endianness model).
-ENERGY_V1 = (0x0102, 0x0304, 0x0506, 0x0708)   # 0x0102030405060708
-ENERGY_V2 = (0x0A0B, 0x0C0D, 0x0E0F, 0x1011)   # 0x0A0B0C0D0E0F1011
-TEMP_V1 = (0x00EB, 0x0000)                     # raw 235  -> 23.5
-TEMP_V2 = (0xFFD8, 0xFFFF)                     # raw -40  -> -4.0
-
-
-def image(version):
-    regs = dict(enumerate(ENERGY_V1 + TEMP_V1))
-    regs[6] = version
-    return regs
-
-
-def show_snapshot(snap):
-    g = snap["boiler"]
-    print(f"  committed on attempt {g.attempts}, version {g.version}")
-    for v in g.values:
-        # v.value is the exact Fraction; value_float is its correctly
-        # rounded double (see README error statement).
-        print(
-            f"  {v.name:<7} raw={v.raw:<21} exact={str(v.value):<24} "
-            f"float={v.value_float}"
-        )
 
 
 class ReadLogger:
@@ -72,70 +36,129 @@ class ReadLogger:
 
     def read(self, start, count):
         words = self._dev.read(start, count)
-        self.log.append((start, count, words))
+        self.log.append((start, count))
         return words
 
 
+def show_plan(plan):
+    blocks = ", ".join(
+        f"read({b.start}, {b.count})" for b in plan.blocks
+    ) or "(none)"
+    print(f"  plan for {plan.name!r}: {blocks}")
+    print(
+        f"  data reads/attempt: {plan.data_read_count} "
+        f"(+2 version reads = {plan.attempt_reads}), "
+        f"extra gap registers: {plan.extra_words}, "
+        f"covered registers: {plan.covered_words}"
+    )
+
+
 def main():
-    print("=== 1. Clean scan (normal result) ===")
-    dev = DeviceMirror(16, initial=image(version=2))
-    snap = Scanner(ScanConfig(max_read_words=2)).scan(dev, [GROUP])
-    show_snapshot(snap)
+    print("=== 1. Planned merge: overlapping/adjacent fields, fewer reads ===")
+    # Register map (image size 16):
+    #   0..3  energy  u64
+    #   2..5  mirror  u64 (deliberately overlaps energy at 2..3)
+    #   6     version register
+    energy = FieldSpec("energy", 0, width=64)
+    mirror = FieldSpec("mirror", 2, width=64)
+    group = RegisterGroup(
+        "boiler", 6, (energy, mirror), allow_overlap=True
+    )
+    initial = {
+        0: 0x0102, 1: 0x0304, 2: 0x0506, 3: 0x0708,
+        4: 0x090A, 5: 0x0B0C, 6: 2,
+    }
+    dev = DeviceMirror(16, initial=initial)
+    scanner = Scanner(ScanConfig(max_read_words=6, max_gap_words=0))
+    plan = scanner.build_plan(dev, [group])["boiler"]
+    show_plan(plan)
+    assert plan.data_read_count == 1 and plan.extra_words == 0
+    logger = ReadLogger(dev)
+    snap = scanner.scan(logger, [group])
+    print(f"  device calls: {logger.log}  (version, one block, version)")
+    g = snap["boiler"]
+    print(f"  committed on attempt {g.attempts}, version {g.version}")
+    print(f"  energy.raw = {g['energy'].raw:#018x}")
+    print(f"  mirror.raw = {g['mirror'].raw:#018x}")
+    assert g["energy"].raw == 0x0102030405060708
+    assert g["mirror"].raw == 0x05060708090A0B0C
 
     print()
-    print("=== 2. Torn 64-bit read across chunks: discarded, retried ===")
-    # max_read_words=2 splits the 6-word data span into 3 chunks.
-    # After the first data chunk (read #1) the device atomically
-    # rewrites the whole group and bumps the version 2 -> 4.
-    dev = DeviceMirror(
+    print("=== 2. Forbidden hole forces a split; mid-attempt commit retried ===")
+    # Fields 0..1 and 5..6; registers 2..4 are a forbidden hole, and
+    # register 7 is the version.  max_read_words=9 would allow one read
+    # 0..6, but that read crosses the hole, so the planner splits.
+    a = FieldSpec("a", 0)
+    b = FieldSpec("b", 5)
+    split_group = RegisterGroup(
+        "split", 7, (a, b), forbidden_ranges=((2, 5),)
+    )
+
+    class GuardedMirror(DeviceMirror):
+        def read(self, start, count):
+            for addr in range(start, start + count):
+                if 2 <= addr < 5:
+                    raise AssertionError(
+                        f"forbidden register {addr} must not be read"
+                    )
+            return super().read(start, count)
+
+    # The device commits once (version 2 -> 4, field b changes) right
+    # after the first version read of attempt 1: that attempt is torn
+    # and discarded, then the identical plan re-runs and commits.
+    dev = GuardedMirror(
         16,
         script=[
-            (),  # read #0 (version): not yet
             (
-                Change.set_version(6, 3),  # odd: write in progress
-                Change.set_words(0, ENERGY_V2 + TEMP_V2),
-                Change.set_version(6, 4),  # even: stable again
-            ),  # lands right after read #1 -> tears the u64 field
+                Change.set_version(7, 3),
+                Change.set_words(5, (0x00, 0x03)),
+                Change.set_version(7, 4),
+            ),
         ],
-        initial=image(version=2),
+        initial={0: 0x00, 1: 0x01, 5: 0x00, 6: 0x02, 7: 2},
     )
+    scanner = Scanner(ScanConfig(max_attempts=3, max_read_words=9,
+                                 max_gap_words=4))
+    plan = scanner.build_plan(dev, [split_group])["split"]
+    show_plan(plan)
+    assert [blk.as_tuple() for blk in plan.blocks] == [(0, 2), (5, 2)]
     logger = ReadLogger(dev)
-    snap = Scanner(ScanConfig(max_attempts=3, max_read_words=2)).scan(
-        logger, [GROUP]
-    )
-    # Reconstruct what attempt 1 actually stitched together, from the
-    # logged raw reads: version, chunk(0..1), chunk(2..3), chunk(4..5),
-    # version.  The u64 spans chunks 1 and 2, i.e. old words 0..1 glued
-    # to new words 2..3.
-    r = logger.log
-    torn_words = r[1][2] + r[2][2]
-    torn = decode_field(ENERGY, torn_words)
-    print(f"  attempt 1 raw reads: {[list(t[2]) for t in r[:5]]}")
+    snap = scanner.scan(logger, [split_group])
     print(
-        f"  attempt 1 saw version {r[0][2][0]} then {r[4][2][0]} "
-        f"-> gate rejects"
+        "  device calls across both attempts:\n  "
+        f"{logger.log}"
     )
-    print(f"  discarded torn u64: {torn.raw:#018x} (old high | new low)")
-    print("  retry commits the consistent new state:")
-    show_snapshot(snap)
-    good = snap["boiler"]["energy"].raw
-    assert good == 0x0A0B0C0D0E0F1011 and good != torn.raw
+    # Attempt 1: v,[0..1],[5..6],v (rejected 2->4); attempt 2 repeats
+    # the same four reads from scratch -- no block from attempt 1 is
+    # reused.  No call ever covers 2..4.
+    assert logger.log == [
+        (7, 1), (0, 2), (5, 2), (7, 1),
+        (7, 1), (0, 2), (5, 2), (7, 1),
+    ]
+    g = snap["split"]
+    print(
+        f"  committed on attempt {g.attempts}, version {g.version}: "
+        f"a.raw={g['a'].raw:#06x}, b.raw={g['b'].raw:#06x}"
+    )
+    assert g.attempts == 2 and g.version == 4 and g["b"].raw == 0x0003
 
     print()
     print("=== 3. Version stuck odd: rejection boundary actually raised ===")
-    dev = DeviceMirror(16, initial=image(version=3))  # odd forever
+    dev = DeviceMirror(16, initial={0: 0, 1: 0, 5: 0, 6: 0, 7: 3})
     try:
-        Scanner(ScanConfig(max_attempts=4, max_read_words=2)).scan(dev, [GROUP])
+        Scanner(ScanConfig(max_attempts=4, max_read_words=9)).scan(
+            dev, [split_group]
+        )
     except InconsistentScanError as exc:
         print(f"  InconsistentScanError: {exc}")
-        print(f"  attempts used: {exc.attempts}; no field values exposed:")
-        print(f"  reasons carry version words only -> {exc.reasons[0]}")
+        print(f"  attempts used: {exc.attempts}")
+        print(f"  reason carries version words only -> {exc.reasons[0]}")
     else:
         raise AssertionError("expected InconsistentScanError")
 
     print()
-    print("demo finished: 1 committed snapshot, 1 torn read discarded,")
-    print("1 rejection boundary raised -- all computed live.")
+    print("demo finished: 1 merged plan, 1 forbidden-hole split with a")
+    print("full-plan retry, 1 rejection boundary -- all computed live.")
 
 
 if __name__ == "__main__":
