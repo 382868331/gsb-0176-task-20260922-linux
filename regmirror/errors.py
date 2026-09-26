@@ -8,6 +8,16 @@ Error semantics (fixed public contract):
 * ``AddressError``      -- a register read lies outside the device image.
 * ``DeviceReadError``   -- the device image did not honour ``read`` (raised,
                            wrong length, non-register word).
+* ``PlanConflictError`` -- a write plan is impossible by construction:
+                           overlapping masks demand opposite bit values
+                           (or an entry is malformed). Raised before any
+                           device access.
+* ``VersionConflictError`` -- a batch write was rejected by the simulated
+                           device because the version register no longer
+                           matched the plan. Nothing was written.
+* ``PrepareRetriesExhausted`` -- building the plan could never observe a
+                           stable (even, unchanged) version within the
+                           attempt budget.
 * ``InconsistentScanError`` -- the retry *budget* was exhausted while the
                            version gate kept failing. No decoded field values
                            are ever attached to this exception.
@@ -24,6 +34,9 @@ __all__ = [
     "DeviceReadError",
     "InconsistentRead",
     "InconsistentScanError",
+    "PlanConflictError",
+    "VersionConflictError",
+    "PrepareRetriesExhausted",
 ]
 
 
@@ -45,6 +58,50 @@ class AddressError(ConfigError):
 
 class DeviceReadError(RegMirrorError):
     """The device image violated the ``read(start, count)`` contract."""
+
+
+class PlanConflictError(ConfigError):
+    """A write plan is self-contradictory or malformed.
+
+    Raised *before* any device access (same "proven impossible" family as
+    :class:`ConfigError`): e.g. two items in one batch overlap on a bit
+    but require different final values, or a requested value sets bits
+    outside its mask.
+    """
+
+
+class VersionConflictError(RegMirrorError):
+    """The compare-and-write batch was rejected: the version moved.
+
+    Attributes:
+        expected_version: even version word the plan was prepared against.
+        observed_version: version word the device held at submit time.
+
+    The whole batch is refused atomically -- no register is modified.  A
+    blind retry with the stale plan is never performed; the caller must
+    re-read and prepare a new plan.
+    """
+
+    def __init__(self, expected_version: int, observed_version: int):
+        self.expected_version = expected_version
+        self.observed_version = observed_version
+        super().__init__(
+            f"compare-and-write rejected: expected version "
+            f"{expected_version}, device holds {observed_version}"
+        )
+
+
+class PrepareRetriesExhausted(RegMirrorError):
+    """No stable version was observed while preparing a write plan."""
+
+    def __init__(self, attempts: int, version_before: int, version_after: int):
+        self.attempts = attempts
+        self.version_before = version_before
+        self.version_after = version_after
+        super().__init__(
+            f"write plan could not be prepared after {attempts} "
+            f"attempt(s): version {version_before} -> {version_after}"
+        )
 
 
 @dataclass(frozen=True)

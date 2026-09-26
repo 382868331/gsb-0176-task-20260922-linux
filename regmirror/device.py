@@ -27,9 +27,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from .errors import AddressError, DeviceReadError
+from .errors import (
+    AddressError,
+    DeviceReadError,
+    PlanConflictError,
+    VersionConflictError,
+)
 
-__all__ = ["Change", "DeviceMirror"]
+__all__ = ["Change", "DeviceMirror", "CompareWriteResult"]
 
 MAX_ADDRESS = 0xFFFF  # 16-bit register address space
 
@@ -191,6 +196,94 @@ class DeviceMirror:
                 f"peek({start}, {count}) outside image of size {len(self._regs)}"
             )
         return tuple(self._regs[start : start + count])
+
+    def compare_version_and_write(
+        self,
+        version_address: int,
+        expected_version: int,
+        updates: dict[int, int],
+        new_values: dict[int, int],
+    ) -> "CompareWriteResult":
+        """Apply one masked batch write iff the version still matches.
+
+        This is the *simulated device side* of the local compare-and-write
+        protocol -- an atomic state-machine transition, not a claim that a
+        real device offers such a command.
+
+        For every register address, ``word = (word & ~mask) | value`` where
+        ``mask = updates[address]`` and ``value = new_values[address]``.
+        All register changes and the version bump (+2 mod 2**16) happen in
+        one indivisible step, or nothing happens at all.
+
+        The batch is refused (no register touched, version unchanged) when
+        the current version word differs from ``expected_version`` or is
+        odd (a real device would be mid-commit).
+        """
+        version_address = _check_int("version_address", version_address)
+        expected_version = _check_word("expected_version", expected_version)
+        if not (0 <= version_address < len(self._regs)):
+            raise AddressError(
+                f"version_address {version_address} outside image of "
+                f"size {len(self._regs)}"
+            )
+        if not isinstance(updates, dict) or not isinstance(new_values, dict):
+            raise TypeError("updates and new_values must be dicts")
+        if set(updates) != set(new_values):
+            raise PlanConflictError(
+                "updates and new_values must cover the same addresses"
+            )
+        if version_address in updates:
+            raise PlanConflictError(
+                f"the version register {version_address} cannot be part "
+                "of a write batch"
+            )
+        merged: dict[int, int] = {}
+        for addr in sorted(updates):
+            a = _check_int("register address", addr)
+            mask = _check_word("mask", updates[a])
+            value = _check_word("new value", new_values[a])
+            if mask == 0:
+                raise PlanConflictError(
+                    f"register {a}: mask must select at least one bit"
+                )
+            if value & ~mask:
+                raise PlanConflictError(
+                    f"register {a}: new value {value:#06x} sets bits "
+                    f"outside mask {mask:#06x}"
+                )
+            if not (0 <= a < len(self._regs)):
+                raise AddressError(
+                    f"register {a} outside image of size {len(self._regs)}"
+                )
+            merged[a] = (mask, value)
+
+        current = self._regs[version_address]
+        if current != expected_version or (current & 1):
+            raise VersionConflictError(expected_version, current)
+
+        for addr, (mask, value) in merged.items():
+            self._regs[addr] = (self._regs[addr] & ~mask) | value
+        self._regs[version_address] = (current + 2) & 0xFFFF
+        return CompareWriteResult(
+            version_address=version_address,
+            version_before=current,
+            version_after=self._regs[version_address],
+            masks=tuple((a, merged[a][0]) for a in sorted(merged)),
+            old_words=tuple(
+                (a, (self._regs[a] & merged[a][0]) | 0) for a in sorted(merged)
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class CompareWriteResult:
+    """Device-side acknowledgement of a committed compare-and-write."""
+
+    version_address: int
+    version_before: int
+    version_after: int
+    masks: tuple[tuple[int, int], ...]
+    old_words: tuple[tuple[int, int], ...]
 
 
 def check_read_result(start: int, count: int, result: object) -> tuple[int, ...]:
