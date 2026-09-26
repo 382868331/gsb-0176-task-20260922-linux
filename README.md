@@ -10,11 +10,21 @@
 - 平台：Linux 原生；核心、测试、演示全部离线，无需网络/账号/硬件/Docker
 - 示例数据由仓库内确定性代码生成（`DeviceMirror` 脚本化变更）
 
+## 环境准备（venv）
+
+不需要任何第三方依赖；如希望隔离环境：
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate        # 可选；直接用系统 python3 也可以
+```
+
 ## 快速运行
 
 ```bash
-python -m unittest discover -s tests -v   # 35 个测试
-python demo.py                            # 约 0.1 秒，真实计算
+python -m unittest discover -s tests -v   # 53 个测试
+python demo.py                            # 原子扫描演示，约 0.1 秒
+python demo_iteration.py                  # 位字段表解码演示，约 0.1 秒
 ```
 
 ## 接口概览
@@ -55,6 +65,55 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
 
 设备对象需提供 `read(start, count) -> 16 位字序列` 和正整数 `size`。
 扫描器对每次返回做长度与 0..65535 校验，违规抛 `DeviceReadError`。
+
+## 位字段表解码（跨寄存器字段）
+
+在原子扫描之上，`regmirror.bitfields` 提供第二个解码入口：调用方给一份
+**字段表**，按起始 bit、宽度、有/无符号和 16 位寄存器字序描述字段，
+字段可横跨任意多个寄存器（1..64 位）。解码结果除数值外，还报告每个值
+**实际用到的寄存器地址及 16 位掩码**。
+
+```python
+from regmirror import (
+    BitFieldSpec, BitFieldTable, BitFieldGroup,
+    Scanner, ScanConfig, decode_bitfields,
+)
+
+table = BitFieldTable(0, [
+    BitFieldSpec("temp", 4, 36, signed=True, word_order="big"),  # 跨 3 字
+    BitFieldSpec("raw_view",    48, 16, union="reg3"),           # union 视图 1
+    BitFieldSpec("signed_view", 48, 16, signed=True, union="reg3"),  # 视图 2
+])
+group = BitFieldGroup("boiler", version_address=10, table=table)
+snap  = Scanner(ScanConfig()).scan(device, [group])   # 一次验证后的镜像
+v = snap["boiler"].values[0]
+# BitFieldValue: .raw(带符号解释) .unsigned(原始位串)
+#                .registers(用到的寄存器) .masks(每个寄存器的掩码)
+```
+
+位模型（固定约定）：
+
+- 寄存器 bit 0 = LSB，bit 15 = MSB；字段占用逻辑位区间
+  `[bit_offset, bit_offset + width)`。
+- `word_order="little"`：字段跨度内低地址寄存器放最低有效位；
+  `"big"`：低地址寄存器放最高有效位（与 `FieldSpec` 的字序语义一致，
+  字节序不在本层处理——位字段直接作用于 16 位字）。
+- `signed=True` 按 `width` 位二进制补码解释。
+
+布局与原子性约定：
+
+- **重叠拒绝**：两个字段在同一寄存器上的掩码相交即非法，在建表时
+  （任何设备读取之前）抛 `ConfigError`；唯一例外是双方显式声明同一个
+  非空 `union` 标签——表示同一 union 的不同视图（如 C union）。
+- **单一镜像**：`decode_bitfields(table, words)` 只消费一次已验证扫描
+  提交的 `{地址: 字}` 镜像，绝不为某个字段临时再读第二份数据。
+- **不产生部分结果**：缺字抛 `IncompleteImageError`、字非法抛
+  `DeviceReadError`、布局非法抛 `ConfigError`，且都在**任何字段被
+  解码之前**；世代（版本）冲突由扫描层抛 `InconsistentScanError`，
+  同样不携带任何解码值。
+- `BitFieldGroup` 与 `RegisterGroup` 一样可直接交给 `Scanner.scan`：
+  扫描器在版本门控内把表的寄存器区间**读一次**，提交后由
+  `group.decode` 解码；旧的 `FieldSpec` 原始寄存器接口完全保留。
 
 ## 扫描协议与版本语义
 
@@ -99,6 +158,8 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
 - 寄存器地址空间：0..65535；镜像大小 1..65536 字。
 - 字段宽度：32 或 64 位（2 或 4 字）；`max_read_words` ≤ 65536。
 - `max_attempts` ≤ 1_000_000；一次扫描的提交次数契约上限 32767。
+- 位字段：宽度 1..64 位，起始 bit 0..1048560；同表字段不得重叠，
+  除非声明同一 `union` 标签。
 
 ## 设计取舍
 
@@ -118,11 +179,14 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
 - 单线程顺序扫描；组间无并行。
 - 设备脚本（`DeviceMirror`）是确定性测试夹具，不是真实现场设备模型。
 - 字段宽度仅 32/64 位，不含 16 位字段（可直接读单字，无需本模块）。
+- 位字段层不处理寄存器内字节序（直接作用于 16 位字）；需要字节序
+  建模时请用 `FieldSpec` 接口。
 
 ## 仓库结构
 
 ```
-regmirror/           核心库（errors / device / fields / scanner）
-tests/               35 个 unittest（期望值手工计算，独立参考）
+regmirror/           核心库（errors / device / fields / bitfields / scanner）
+tests/               53 个 unittest（期望值手工计算，独立参考）
 demo.py              固定输入演示：正常提交 + 撕裂读丢弃 + 拒绝边界
+demo_iteration.py    位字段表演示：union 双视图 + 三类拒绝边界
 ```

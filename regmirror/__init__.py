@@ -10,6 +10,15 @@ Offline, standard-library-only module.  Public surface:
 """
 
 from .device import Change, DeviceMirror
+from .bitfields import (
+    BitFieldGroup,
+    BitFieldSpec,
+    BitFieldTable,
+    BitFieldValue,
+    IncompleteImageError,
+    decode_bitfields,
+    register_masks,
+)
 from .errors import (
     AddressError,
     ConfigError,
@@ -32,6 +41,10 @@ __version__ = "1.0.0"
 
 __all__ = [
     "AddressError",
+    "BitFieldGroup",
+    "BitFieldSpec",
+    "BitFieldTable",
+    "BitFieldValue",
     "Change",
     "ConfigError",
     "DeviceMirror",
@@ -39,6 +52,7 @@ __all__ = [
     "FieldSpec",
     "FieldValue",
     "GroupSnapshot",
+    "IncompleteImageError",
     "InconsistentRead",
     "InconsistentScanError",
     "MAX_COMMITS_PER_SCAN",
@@ -47,7 +61,9 @@ __all__ = [
     "ScanConfig",
     "Scanner",
     "Snapshot",
+    "decode_bitfields",
     "decode_field",
     "encode_field",
+    "register_masks",
     "__version__",
 ]

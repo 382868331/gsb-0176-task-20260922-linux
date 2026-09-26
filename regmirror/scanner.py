@@ -123,6 +123,16 @@ class RegisterGroup:
             max(f.last_address for f in self.fields),
         )
 
+    def decode(self, data: dict[int, int]) -> tuple[FieldValue, ...]:
+        """Decode all fields from one committed register mirror."""
+        return tuple(
+            decode_field(
+                f,
+                tuple(data[a] for a in range(f.address, f.last_address + 1)),
+            )
+            for f in self.fields
+        )
+
 
 @dataclass(frozen=True)
 class ScanConfig:
@@ -214,9 +224,16 @@ class Scanner:
         if not groups:
             raise ConfigError("at least one group is required")
         for g in groups:
-            if not isinstance(g, RegisterGroup):
+            if not (
+                isinstance(g, RegisterGroup)
+                or all(
+                    hasattr(g, attr)
+                    for attr in ("name", "version_address", "data_span", "decode")
+                )
+            ):
                 raise ConfigError(
-                    f"groups must contain RegisterGroup, got {type(g).__name__}"
+                    f"groups must contain RegisterGroup or BitFieldGroup, "
+                    f"got {type(g).__name__}"
                 )
         names = [g.name for g in groups]
         if len(set(names)) != len(names):
@@ -266,13 +283,7 @@ class Scanner:
                 addr += n
             v2 = self._read(device, group.version_address, 1)[0]
             if v1 == v2 and not (v1 & 1):
-                values = tuple(
-                    decode_field(
-                        f,
-                        tuple(data[a] for a in range(f.address, f.last_address + 1)),
-                    )
-                    for f in group.fields
-                )
+                values = group.decode(data)
                 return GroupSnapshot(group.name, v1, _attempt, values)
             last_reason = InconsistentRead(group.name, v1, v2)
         assert last_reason is not None  # max_attempts >= 1
