@@ -203,6 +203,51 @@ class Scanner:
             committed.append(self._scan_group(device, group))
         return Snapshot(tuple(committed))
 
+    def scan_layout(self, device: object, layout: object) -> object:
+        """Scan one BitLayout atomically and decode all its fields.
+
+        The layout is fully validated before the first device read.
+        Every field is decoded from the *single* version-gated mirror
+        committed by this call -- the device is never re-read for an
+        individual field.  A generation (version) conflict exhausts the
+        retry budget and raises InconsistentScanError carrying no
+        decoded values; a misbehaving device raises DeviceReadError.
+        Either way there is no partial decode.
+        """
+        from .bitfields import BitLayout, LayoutSnapshot, decode_bitfields
+
+        if not isinstance(layout, BitLayout):
+            raise ConfigError(
+                f"layout must be a BitLayout, got {type(layout).__name__}"
+            )
+        self._validate_device(device)
+        size = device.size
+        if layout.last_address >= size:
+            raise AddressError(
+                f"layout {layout.name!r}: data registers "
+                f"{layout.base_address}..{layout.last_address} outside "
+                f"device image of size {size}"
+            )
+        if layout.version_address >= size:
+            raise AddressError(
+                f"layout {layout.name!r}: version register "
+                f"{layout.version_address} outside device image of size "
+                f"{size}"
+            )
+        version, attempts, data = self._scan_span(
+            device,
+            layout.name,
+            layout.version_address,
+            layout.base_address,
+            layout.last_address,
+        )
+        words = tuple(
+            data[a] for a in range(layout.base_address, layout.last_address + 1)
+        )
+        return LayoutSnapshot(
+            layout.name, version, attempts, decode_bitfields(layout, words)
+        )
+
     # -- internals ------------------------------------------------------
 
     def _validate(
@@ -221,17 +266,8 @@ class Scanner:
         names = [g.name for g in groups]
         if len(set(names)) != len(names):
             raise ConfigError(f"duplicate group names {sorted(names)}")
-        read = getattr(device, "read", None)
-        if not callable(read):
-            raise ConfigError(
-                f"device must provide read(start, count), "
-                f"got {type(device).__name__}"
-            )
-        size = getattr(device, "size", None)
-        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
-            raise ConfigError(
-                f"device must expose a positive int size, got {size!r}"
-            )
+        self._validate_device(device)
+        size = device.size
         for g in groups:
             first, last = g.data_span
             if last >= size:
@@ -246,17 +282,39 @@ class Scanner:
                 )
         return groups
 
+    def _validate_device(self, device: object) -> None:
+        read = getattr(device, "read", None)
+        if not callable(read):
+            raise ConfigError(
+                f"device must provide read(start, count), "
+                f"got {type(device).__name__}"
+            )
+        size = getattr(device, "size", None)
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise ConfigError(
+                f"device must expose a positive int size, got {size!r}"
+            )
+
     def _read(self, device: object, start: int, count: int) -> tuple[int, ...]:
         return check_read_result(start, count, device.read(start, count))
 
-    def _scan_group(
-        self, device: object, group: RegisterGroup
-    ) -> GroupSnapshot:
-        first, last = group.data_span
+    def _scan_span(
+        self,
+        device: object,
+        name: str,
+        version_address: int,
+        first: int,
+        last: int,
+    ) -> tuple[int, int, dict[int, int]]:
+        """Version-gated read of registers [first, last].
+
+        Returns (committed_version, attempts, {address: word}) or raises
+        InconsistentScanError after the retry budget is exhausted.
+        """
         chunk = self.config.max_read_words
         last_reason: InconsistentRead | None = None
         for _attempt in range(1, self.config.max_attempts + 1):
-            v1 = self._read(device, group.version_address, 1)[0]
+            v1 = self._read(device, version_address, 1)[0]
             data: dict[int, int] = {}
             addr = first
             while addr <= last:
@@ -264,16 +322,25 @@ class Scanner:
                 words = self._read(device, addr, n)
                 data.update(zip(range(addr, addr + n), words))
                 addr += n
-            v2 = self._read(device, group.version_address, 1)[0]
+            v2 = self._read(device, version_address, 1)[0]
             if v1 == v2 and not (v1 & 1):
-                values = tuple(
-                    decode_field(
-                        f,
-                        tuple(data[a] for a in range(f.address, f.last_address + 1)),
-                    )
-                    for f in group.fields
-                )
-                return GroupSnapshot(group.name, v1, _attempt, values)
-            last_reason = InconsistentRead(group.name, v1, v2)
+                return v1, _attempt, data
+            last_reason = InconsistentRead(name, v1, v2)
         assert last_reason is not None  # max_attempts >= 1
         raise InconsistentScanError(self.config.max_attempts, (last_reason,))
+
+    def _scan_group(
+        self, device: object, group: RegisterGroup
+    ) -> GroupSnapshot:
+        first, last = group.data_span
+        version, attempts, data = self._scan_span(
+            device, group.name, group.version_address, first, last
+        )
+        values = tuple(
+            decode_field(
+                f,
+                tuple(data[a] for a in range(f.address, f.last_address + 1)),
+            )
+            for f in group.fields
+        )
+        return GroupSnapshot(group.name, version, attempts, values)

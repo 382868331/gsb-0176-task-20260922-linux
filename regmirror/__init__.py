@@ -9,6 +9,13 @@ Offline, standard-library-only module.  Public surface:
 * error hierarchy rooted at :class:`RegMirrorError`
 """
 
+from .bitfields import (
+    BitFieldSpec,
+    BitLayout,
+    LayoutSnapshot,
+    LayoutValue,
+    decode_bitfields,
+)
 from .device import Change, DeviceMirror
 from .errors import (
     AddressError,
@@ -28,10 +35,12 @@ from .scanner import (
     Snapshot,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "AddressError",
+    "BitFieldSpec",
+    "BitLayout",
     "Change",
     "ConfigError",
     "DeviceMirror",
@@ -41,12 +50,15 @@ __all__ = [
     "GroupSnapshot",
     "InconsistentRead",
     "InconsistentScanError",
+    "LayoutSnapshot",
+    "LayoutValue",
     "MAX_COMMITS_PER_SCAN",
     "RegisterGroup",
     "RegMirrorError",
     "ScanConfig",
     "Scanner",
     "Snapshot",
+    "decode_bitfields",
     "decode_field",
     "encode_field",
     "__version__",

@@ -7,15 +7,79 @@
 `InconsistentScanError`。
 
 - Python 版本：**3.14.7**（仅标准库，安装 Python 后无任何额外依赖）
+- 库版本：**1.1.0**（新增跨字位字段表解码，见下文"位级字段表"）
 - 平台：Linux 原生；核心、测试、演示全部离线，无需网络/账号/硬件/Docker
 - 示例数据由仓库内确定性代码生成（`DeviceMirror` 脚本化变更）
+
+## 环境准备（venv）
+
+仓库根目录已带 `.venv` 符号链接；如需重建：
+
+```bash
+python3.14 -m venv .venv        # 或 python3 -m venv .venv
+source .venv/bin/activate       # 之后直接用 python 即可
+```
+
+venv 不是必需的——系统 Python 3.14.7 直接运行下列命令亦可，
+模块只依赖标准库，无需 pip install。
 
 ## 快速运行
 
 ```bash
-python -m unittest discover -s tests -v   # 35 个测试
-python demo.py                            # 约 0.1 秒，真实计算
+python -m unittest discover -s tests -v   # 54 个测试
+python demo.py                            # 旧版原子扫描演示，约 0.1 秒
+python demo_iteration.py                  # 位级字段表演示，约 0.1 秒
 ```
+
+## 位级字段表（本轮新增）
+
+调用方给一份字段表：每个字段声明**起始 bit、宽度、有无符号**，表级声明
+16 位寄存器的**字序**；字段可横跨任意多个寄存器。解码入口返回每个值
+**实际用到的寄存器及掩码**。
+
+```python
+from regmirror import BitFieldSpec, BitLayout, Scanner, decode_bitfields
+
+layout = BitLayout(
+    "boiler-bits",
+    version_address=2,          # 16 位版本寄存器（奇=写入中，偶=稳定）
+    base_address=4,             # 布局覆盖的连续寄存器起点
+    word_order="little",        # 低地址寄存器是最低有效字
+    fields=[
+        BitFieldSpec("temp", start_bit=4, width=20, signed=True),
+        BitFieldSpec("mode", start_bit=24, width=4),
+    ],
+)
+snap = Scanner().scan_layout(device, layout)   # 一次版本门控扫描
+v = snap["temp"]                # LayoutValue: .value, .registers
+# v.registers == ((4, 0xFFF0), (5, 0x00FF))  实际用到的寄存器与掩码
+```
+
+### 位串模型（固定契约）
+
+- 布局覆盖 `base_address` 起 `n_words` 个连续 16 位寄存器，
+  `n_words` 由最高使用位推出。
+- `word_order="little"`：低地址寄存器是最低有效字；`"big"` 反之。
+  按字序拼成一条逻辑位串，bit 0 是最低有效字的最低位。
+- 字段 `start_bit=s, width=w` 占逻辑位 `[s, s+w)`，无符号原值为
+  `(logical >> s) & ((1<<w)-1)`；`signed=True` 按二进制补码解释。
+- `LayoutValue.registers` 是按地址排序的 `(地址, 掩码)` 对，
+  掩码标出该寄存器中属于此字段的位。
+
+### union 与重叠
+
+- 字段可用 `union="标签"` 显式声明为**同一 union 的不同视图**，
+  同一 union 内的字段允许重叠（同一镜像的多个合法视图）。
+- 其余任何位重叠都是非法布局，在**首次设备读取之前**抛 `ConfigError`。
+
+### 原子性约定
+
+- `Scanner.scan_layout` 的所有字段都从**同一次已验证的镜像**解码，
+  绝不为某个字段临时读取第二份数据。
+- 缺字（字数不符/非 16 位字）、世代冲突（版本门控重试耗尽）、
+  非法布局都抛异常，**不产生任何部分解码结果**。
+- 纯函数 `decode_bitfields(layout, words)` 可从已提交的字序列离线解码，
+  同样全有或全无。
 
 ## 接口概览
 
@@ -44,6 +108,9 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
 | 名称 | 说明 |
 |---|---|
 | `FieldSpec` | 字段布局：`name, address, width(32/64), signed, word_order, byte_order, scale(Fraction)` |
+| `BitFieldSpec` | 位级字段：`name, start_bit, width(>=1), signed, union` |
+| `BitLayout` | 位级字段表：`name, version_address, base_address, fields, word_order`；非 union 重叠在扫描前拒绝 |
+| `LayoutValue` / `LayoutSnapshot` | 位级解码结果：`value` + `registers`（寄存器/掩码对） |
 | `FieldValue` | 解码结果：`raw`(int)、`value`(精确 `Fraction = raw*scale`)、`value_float`(float) |
 | `RegisterGroup` | 一组字段 + 一个 16 位版本寄存器地址；字段区间不得互相重叠、不得覆盖版本寄存器 |
 | `ScanConfig` | `max_attempts`(1..1_000_000，默认 4)、`max_read_words`(1..65536，默认 16) |
@@ -118,11 +185,14 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
 - 单线程顺序扫描；组间无并行。
 - 设备脚本（`DeviceMirror`）是确定性测试夹具，不是真实现场设备模型。
 - 字段宽度仅 32/64 位，不含 16 位字段（可直接读单字，无需本模块）。
+- 位级字段表（`BitLayout`）无字节序概念：寄存器内位序固定为
+  bit 0 = 该 16 位字的最低位；只有字序可选。
 
 ## 仓库结构
 
 ```
-regmirror/           核心库（errors / device / fields / scanner）
-tests/               35 个 unittest（期望值手工计算，独立参考）
-demo.py              固定输入演示：正常提交 + 撕裂读丢弃 + 拒绝边界
+regmirror/           核心库（errors / device / fields / bitfields / scanner）
+tests/               54 个 unittest（期望值手工计算，独立参考）
+demo.py              旧版演示：正常提交 + 撕裂读丢弃 + 拒绝边界
+demo_iteration.py    位级字段表演示：正常/边界/union/拒绝 + 旧接口保留
 ```
