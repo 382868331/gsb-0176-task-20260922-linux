@@ -27,7 +27,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from .errors import AddressError, DeviceReadError
+from .errors import AddressError, DeviceReadError, VersionConflictError
 
 __all__ = ["Change", "DeviceMirror"]
 
@@ -191,6 +191,63 @@ class DeviceMirror:
                 f"peek({start}, {count}) outside image of size {len(self._regs)}"
             )
         return tuple(self._regs[start : start + count])
+
+    def compare_version_and_write(
+        self,
+        version_address: int,
+        expected_version: int,
+        writes: Sequence[tuple[int, int]],
+    ) -> int:
+        """Atomically commit writes iff the version still matches.
+
+        writes is a sequence of (address, word) pairs.  If the version
+        register currently holds expected_version (an even, stable
+        word), every pair is applied together and the version is bumped
+        by 2 (mod 2**16); the new version is returned.  Otherwise the
+        whole batch is rejected with VersionConflictError and no
+        register is modified -- the image never commits half a batch.
+
+        All addresses and words are validated *before* the version
+        check, so a malformed batch never touches the image either.
+        This is a local state-machine operation; it does not advance the
+        change script and does not claim to model a real bus command.
+        """
+        version_address = _check_int("version_address", version_address)
+        expected_version = _check_word("expected_version", expected_version)
+        if isinstance(writes, (str, bytes)) or not isinstance(writes, Sequence):
+            raise TypeError("writes must be a sequence of (address, word) pairs")
+        pairs: list[tuple[int, int]] = []
+        for i, item in enumerate(writes):
+            if (
+                isinstance(item, (str, bytes))
+                or not isinstance(item, Sequence)
+                or len(item) != 2
+            ):
+                raise TypeError(
+                    f"writes[{i}] must be an (address, word) pair, "
+                    f"got {item!r}"
+                )
+            addr = _check_int(f"writes[{i}][0]", item[0])
+            word = _check_word(f"writes[{i}][1]", item[1])
+            if addr >= len(self._regs):
+                raise AddressError(
+                    f"writes[{i}] address {addr} outside image of "
+                    f"size {len(self._regs)}"
+                )
+            pairs.append((addr, word))
+        if version_address >= len(self._regs):
+            raise AddressError(
+                f"version_address {version_address} outside image of "
+                f"size {len(self._regs)}"
+            )
+        actual = self._regs[version_address]
+        if actual != expected_version:
+            raise VersionConflictError(expected_version, actual)
+        for addr, word in pairs:
+            self._regs[addr] = word
+        new_version = (expected_version + 2) & 0xFFFF
+        self._regs[version_address] = new_version
+        return new_version
 
 
 def check_read_result(start: int, count: int, result: object) -> tuple[int, ...]:

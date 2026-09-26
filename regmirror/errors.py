@@ -24,6 +24,7 @@ __all__ = [
     "DeviceReadError",
     "InconsistentRead",
     "InconsistentScanError",
+    "VersionConflictError",
 ]
 
 
@@ -86,4 +87,25 @@ class InconsistentScanError(RegMirrorError):
         detail = "; ".join(str(r) for r in self.reasons) or "no groups"
         super().__init__(
             f"snapshot inconsistent after {attempts} attempt(s): {detail}"
+        )
+
+
+class VersionConflictError(RegMirrorError):
+    """The device version changed between plan preparation and commit.
+
+    The whole batch was rejected by the device; **no register was
+    written**.  The stale plan must not be retried blindly: the caller
+    has to re-read the mirror and prepare a fresh plan.
+
+    Attributes:
+        expected: the version word the plan was computed from.
+        actual:   the version word the device currently holds.
+    """
+
+    def __init__(self, expected: int, actual: int):
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"version conflict: plan expected {expected}, "
+            f"device has {actual}; batch rejected, nothing written"
         )
