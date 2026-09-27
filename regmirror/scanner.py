@@ -25,12 +25,13 @@ can detect.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .device import check_read_result
 from .errors import (
     AddressError,
     ConfigError,
+    ScanStateError,
     InconsistentRead,
     InconsistentScanError,
 )
@@ -42,6 +43,9 @@ __all__ = [
     "ScanConfig",
     "GroupSnapshot",
     "Snapshot",
+    "ScanSession",
+    "PublishedImage",
+    "UpdateResult",
     "Scanner",
 ]
 
@@ -176,6 +180,246 @@ class Snapshot:
         return len(self.groups)
 
 
+@dataclass(frozen=True)
+class UpdateResult:
+    """Outcome of :meth:`PublishedImage.try_update`.
+
+    On failure ``snapshot`` is the image that remains published, which is
+    ``None`` for a publisher that has never received a successful scan.
+    """
+
+    updated: bool
+    snapshot: Snapshot | None
+    error: InconsistentScanError | None = None
+
+
+class _PauseRequested(Exception):
+    """Internal control-flow signal at a safe read boundary."""
+
+
+class ScanSession:
+    """A scan that can be paused at device-read boundaries and resumed.
+
+    Pause requests are cooperative: call :meth:`request_pause` (for example
+    from a scripted device wrapper) and the session stops before its next
+    device read.  Partial words are held only in the session; they are never
+    published.  On resume the current version is re-read before reusing any
+    words from before the pause.
+    """
+
+    def __init__(
+        self,
+        scanner: "Scanner",
+        device: object,
+        groups: Sequence[RegisterGroup],
+    ):
+        self._scanner = scanner
+        self._device = device
+        self._groups = scanner._validate(device, groups)
+        self.status = "ready"
+        self._group_index = 0
+        self._attempt = 1
+        self._version_before: int | None = None
+        self._next_data_address = 0
+        self._data: dict[int, int] = {}
+        self._committed: list[GroupSnapshot] = []
+        self._reasons: list[InconsistentRead] = []
+        self._pause_requested = False
+        self._result: Snapshot | None = None
+        self._error: InconsistentScanError | None = None
+
+    @property
+    def result(self) -> Snapshot | None:
+        """Complete snapshot, available only after successful completion."""
+        return self._result
+
+    @property
+    def error(self) -> InconsistentScanError | None:
+        """Retry-budget error, available only after failure."""
+        return self._error
+
+    def request_pause(self) -> None:
+        """Ask the session to stop at the next safe read boundary."""
+        if self.status in {"complete", "failed"}:
+            raise ScanStateError(f"cannot pause a {self.status} session")
+        self._pause_requested = True
+
+    def run(self) -> Snapshot | None:
+        """Run until completion, failure, or a requested pause.
+
+        Returns the complete snapshot on success, or ``None`` if the run
+        stopped because it was paused.
+        """
+        if self.status not in {"ready", "paused", "running"}:
+            raise ScanStateError(f"cannot run a {self.status} session")
+        previous_status = self.status
+        self.status = "running"
+        try:
+            while self._group_index < len(self._groups):
+                if self._version_before is None:
+                    self._resume_at_group_boundary(previous_status == "paused")
+                else:
+                    if previous_status == "paused":
+                        self._resume_mid_attempt()
+                        if self._version_before is None:
+                            previous_status = "running"
+                            continue
+                self._read_attempt_data()
+                self._finish_attempt()
+                previous_status = "running"
+        except _PauseRequested:
+            self.status = "paused"
+            return None
+        except InconsistentScanError as exc:
+            self.status = "failed"
+            self._error = exc
+            raise
+        self._result = Snapshot(tuple(self._committed))
+        self.status = "complete"
+        return self._result
+
+    def _checkpoint(self) -> None:
+        if self._pause_requested:
+            self._pause_requested = False
+            raise _PauseRequested
+
+    def _device_read(self, start: int, count: int) -> tuple[int, ...]:
+        self._checkpoint()
+        return self._scanner._read(self._device, start, count)
+
+    def _begin_group_attempt(self) -> None:
+        group = self._groups[self._group_index]
+        first, _last = group.data_span
+        self._data = {}
+        self._next_data_address = first
+        self._version_before = self._device_read(group.version_address, 1)[0]
+
+    def _resume_at_group_boundary(self, paused: bool) -> None:
+        changed = (
+            self._validate_committed_groups() if paused and self._group_index else []
+        )
+        if not changed:
+            self._begin_group_attempt()
+        else:
+            self._restart_after_invalid_pause(changed[0])
+
+    def _validate_committed_groups(self) -> list[InconsistentRead]:
+        """Return changed groups completed before a pause."""
+        versions = {
+            group.name: self._device_read(group.version_address, 1)[0]
+            for group in self._groups[: self._group_index]
+        }
+        return [
+            InconsistentRead(snapshot.name, snapshot.version, versions[snapshot.name])
+            for snapshot in self._committed
+            if snapshot.version != versions[snapshot.name]
+            or versions[snapshot.name] & 1
+        ]
+
+    def _resume_mid_attempt(self) -> None:
+        group = self._groups[self._group_index]
+        current = self._device_read(group.version_address, 1)[0]
+        if current != self._version_before or (current & 1):
+            reason = InconsistentRead(
+                group.name, self._version_before or 0, current
+            )
+            self._retry_or_fail(reason)
+            self._data = {}
+            self._version_before = None
+
+    def _restart_after_invalid_pause(self, reason: InconsistentRead) -> None:
+        self._retry_or_fail(reason)
+        self._group_index = 0
+        self._committed = []
+        self._begin_group_attempt()
+
+    def _read_attempt_data(self) -> None:
+        group = self._groups[self._group_index]
+        _first, last = group.data_span
+        chunk = self._scanner.config.max_read_words
+        addr = self._next_data_address
+        if addr > last:
+            return
+        while addr <= last:
+            n = min(chunk, last - addr + 1)
+            words = self._device_read(addr, n)
+            self._data.update(zip(range(addr, addr + n), words))
+            addr += n
+            self._next_data_address = addr
+
+    def _finish_attempt(self) -> None:
+        group = self._groups[self._group_index]
+        v2 = self._device_read(group.version_address, 1)[0]
+        assert self._version_before is not None
+        if self._version_before == v2 and not (v2 & 1):
+            values = tuple(
+                decode_field(
+                    field,
+                    tuple(
+                        self._data[a]
+                        for a in range(field.address, field.last_address + 1)
+                    ),
+                )
+                for field in group.fields
+            )
+            self._committed.append(
+                GroupSnapshot(
+                    group.name, v2, self._attempt, values
+                )
+            )
+            self._group_index += 1
+            self._version_before = None
+            self._data = {}
+            self._reasons = []
+            self._attempt = 1
+            return
+
+        reason = InconsistentRead(group.name, self._version_before, v2)
+        self._retry_or_fail(reason)
+        self._data = {}
+        self._version_before = None
+
+    def _retry_or_fail(self, reason: InconsistentRead) -> None:
+        self._reasons = [reason]
+        if self._attempt >= self._scanner.config.max_attempts:
+            raise InconsistentScanError(self._attempt, (reason,))
+        self._attempt += 1
+
+
+@dataclass
+class PublishedImage:
+    """In-memory publisher that swaps only to a complete snapshot."""
+
+    current: Snapshot | None = field(default=None)
+    last_error: InconsistentScanError | None = field(default=None)
+
+    def publish(self, snapshot: Snapshot) -> None:
+        if not isinstance(snapshot, Snapshot):
+            raise ConfigError(
+                f"snapshot must be a Snapshot, got {type(snapshot).__name__}"
+            )
+        self.current = snapshot
+        self.last_error = None
+
+    def try_update(
+        self,
+        scanner: "Scanner",
+        device: object,
+        groups: Sequence[RegisterGroup],
+    ) -> UpdateResult:
+        """Attempt an update; retain the previous complete image on failure."""
+        previous = self.current
+        try:
+            snapshot = scanner.scan(device, groups)
+        except InconsistentScanError as exc:
+            self.current = previous
+            self.last_error = exc
+            return UpdateResult(False, previous, exc)
+        self.current = snapshot
+        self.last_error = None
+        return UpdateResult(True, snapshot, None)
+
+
 class Scanner:
     """Scans register groups off a device image with the version gate."""
 
@@ -197,11 +441,8 @@ class Scanner:
         All configuration is validated before the first device read, so
         a misconfigured scan never touches the device.
         """
-        groups = self._validate(device, groups)
-        committed: list[GroupSnapshot] = []
-        for group in groups:
-            committed.append(self._scan_group(device, group))
-        return Snapshot(tuple(committed))
+        session = ScanSession(self, device, groups)
+        return session.run()
 
     # -- internals ------------------------------------------------------
 
@@ -249,31 +490,8 @@ class Scanner:
     def _read(self, device: object, start: int, count: int) -> tuple[int, ...]:
         return check_read_result(start, count, device.read(start, count))
 
-    def _scan_group(
-        self, device: object, group: RegisterGroup
-    ) -> GroupSnapshot:
-        first, last = group.data_span
-        chunk = self.config.max_read_words
-        last_reason: InconsistentRead | None = None
-        for _attempt in range(1, self.config.max_attempts + 1):
-            v1 = self._read(device, group.version_address, 1)[0]
-            data: dict[int, int] = {}
-            addr = first
-            while addr <= last:
-                n = min(chunk, last - addr + 1)
-                words = self._read(device, addr, n)
-                data.update(zip(range(addr, addr + n), words))
-                addr += n
-            v2 = self._read(device, group.version_address, 1)[0]
-            if v1 == v2 and not (v1 & 1):
-                values = tuple(
-                    decode_field(
-                        f,
-                        tuple(data[a] for a in range(f.address, f.last_address + 1)),
-                    )
-                    for f in group.fields
-                )
-                return GroupSnapshot(group.name, v1, _attempt, values)
-            last_reason = InconsistentRead(group.name, v1, v2)
-        assert last_reason is not None  # max_attempts >= 1
-        raise InconsistentScanError(self.config.max_attempts, (last_reason,))
+    def start_session(
+        self, device: object, groups: Sequence[RegisterGroup]
+    ) -> ScanSession:
+        """Create a pause/resume-capable scan session."""
+        return ScanSession(self, device, groups)

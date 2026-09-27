@@ -17,15 +17,19 @@ from .errors import (
     InconsistentRead,
     InconsistentScanError,
     RegMirrorError,
+    ScanStateError,
 )
 from .fields import FieldSpec, FieldValue, decode_field, encode_field
 from .scanner import (
     MAX_COMMITS_PER_SCAN,
     GroupSnapshot,
+    PublishedImage,
     RegisterGroup,
     ScanConfig,
+    ScanSession,
     Scanner,
     Snapshot,
+    UpdateResult,
 )
 
 __version__ = "1.0.0"
@@ -42,11 +46,14 @@ __all__ = [
     "InconsistentRead",
     "InconsistentScanError",
     "MAX_COMMITS_PER_SCAN",
+    "PublishedImage",
     "RegisterGroup",
     "RegMirrorError",
     "ScanConfig",
+    "ScanSession",
     "Scanner",
     "Snapshot",
+    "UpdateResult",
     "decode_field",
     "encode_field",
     "__version__",

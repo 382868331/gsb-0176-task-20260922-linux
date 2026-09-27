@@ -13,7 +13,7 @@
 ## 快速运行
 
 ```bash
-python -m unittest discover -s tests -v   # 35 个测试
+python -m unittest discover -s tests -v   # 39 个测试
 python demo.py                            # 约 0.1 秒，真实计算
 ```
 
@@ -23,6 +23,7 @@ python demo.py                            # 约 0.1 秒，真实计算
 from fractions import Fraction
 from regmirror import (
     FieldSpec, RegisterGroup, ScanConfig, Scanner,
+    ScanSession, PublishedImage, UpdateResult,
     DeviceMirror, Change,                # 合成设备镜像与变更脚本
     RegMirrorError, ConfigError, AddressError,
     DeviceReadError, InconsistentScanError,
@@ -48,8 +49,12 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
 | `RegisterGroup` | 一组字段 + 一个 16 位版本寄存器地址；字段区间不得互相重叠、不得覆盖版本寄存器 |
 | `ScanConfig` | `max_attempts`(1..1_000_000，默认 4)、`max_read_words`(1..65536，默认 16) |
 | `Snapshot` / `GroupSnapshot` | 全部组提交成功的结果；按名字索引 |
+| `ScanSession` | 可暂停/恢复的扫描会话；暂停时缓冲值不会发布 |
+| `PublishedImage` | 只原子替换为完整快照的发布槽；失败保留上一份完整结果 |
+| `UpdateResult` | 更新结果：`updated`、仍发布的 `snapshot`、失败原因 `error` |
 | `DeviceMirror` | 确定性脚本化镜像：`read(start, count)`，脚本步骤 k 在第 k 次 read 之后生效 |
 | `Change` | 脚本原语：`set_words` / `set_version` / `write_field`；同一步的元组原子生效 |
+| `DeviceMirror.apply_changes` | 本地夹具方法：在暂停期间立即应用一次确定性变更 |
 
 ### 设备契约
 
@@ -68,6 +73,26 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
   不超过 **32767** 次"（`MAX_COMMITS_PER_SCAN = 2¹⁶/2 − 1`）时成立；
   32768 次提交会回绕到同一版本字造成混叠，这是部署契约，扫描器无法检测。
 
+## 暂停、恢复与发布
+
+- `Scanner.start_session(device, groups)` 返回 `ScanSession`。会话可在任意**设备读取边界**
+  通过 `request_pause()` 请求暂停；`run()` 返回 `None` 且状态为 `"paused"`。
+- 已读寄存器只保存在会话缓冲中，调用方不能通过 `PublishedImage` 读到它们。
+- 在一次 attempt 中途暂停时，恢复后的第一次读取重新读取该组版本。版本仍为相同偶数
+  才继续读取剩余区间；版本改变或为奇数时，暂停前读取的全部缓冲字作废，并消耗一次重试。
+- 若暂停发生在组边界，恢复后先重新读取此前已经完成组的版本。任一旧组版本变化，说明暂停期间
+  镜像已跨组变化：已完成组结果不能与新组拼接，整个快照从第一个组重新扫描并消耗一次重试。
+- `PublishedImage.try_update(...)` 永远不向调用方发布部分结果。成功时原子替换为新的完整快照；
+  重试耗尽时返回 `UpdateResult(updated=False, snapshot=<旧快照>, error=...)`，发布槽继续保留
+  上一份版本一致的完整镜像；首次更新失败时旧快照为 `None`。
+
+```python
+publisher = PublishedImage()
+result = publisher.try_update(Scanner(), device, groups)
+if not result.updated:
+    assert publisher.current is result.snapshot  # 仍是旧完整镜像，失败无部分替换
+```
+
 ## 字节序/字序模型
 
 - `byte_order="big"`：寄存器内高字节在前；`"little"`：低字节在前。
@@ -82,7 +107,8 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
 | `ConfigError`(`ValueError`) | 配置本身非法，重试无意义（"证明无解"类）；**在任何设备读取之前**抛出 |
 | `AddressError`(`ConfigError`) | 寄存器地址/区间越界 |
 | `DeviceReadError` | 设备违反 `read` 契约（抛错、长度不符、非 16 位字） |
-| `InconsistentScanError` | **重试预算耗尽**（与"配置不可能"明确分开）；不含部分值 |
+| `ScanStateError` | 已完成/失败的会话又请求暂停或运行 |
+| `InconsistentScanError` | **重试预算耗尽**（与配置不可能明确分开）；不含部分值 |
 
 输入校验总则：整数参数拒绝 `bool`；`scale` 接受 int/float/Fraction，
 但 **NaN 与 ±Infinity 一律拒绝**（`ConfigError`），有限 float 按其二进制
@@ -106,6 +132,8 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
   避免"失败留下未说明的部分变更"；扫描本身只读，不写设备。
 - **分段读取固定顺序**（版本→数据升序分段→版本），使脚本化测试的
   变更点可精确对齐到某两次读取之间，撕裂场景确定可复现。
+- **暂停只在读取边界生效**：不会在设备协议中间产生不可判定状态；恢复时以版本寄存器重新建立信任。
+- **发布槽只接受完整快照**：新旧版本不能拼接；失败更新没有删除/覆盖上一份已知完整结果。
 - **失败异常不携带解码值**：`InconsistentScanError` 只含版本字诊断，
   从类型上保证"无部分值"契约。
 - **比例用 `Fraction` 而非 float**：缩放不引入舍入链，浮点仅在调用方
@@ -115,7 +143,7 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
 ## 已知限制
 
 - 版本混叠（≥32768 次提交/扫描）按契约不可检测，需部署侧保证。
-- 单线程顺序扫描；组间无并行。
+- 单线程顺序扫描；暂停是协作式请求，不会从任意线程强行中断设备调用。
 - 设备脚本（`DeviceMirror`）是确定性测试夹具，不是真实现场设备模型。
 - 字段宽度仅 32/64 位，不含 16 位字段（可直接读单字，无需本模块）。
 
@@ -123,6 +151,6 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
 
 ```
 regmirror/           核心库（errors / device / fields / scanner）
-tests/               35 个 unittest（期望值手工计算，独立参考）
-demo.py              固定输入演示：正常提交 + 撕裂读丢弃 + 拒绝边界
+tests/               39 个 unittest（期望值手工计算，独立参考）
+demo.py              正常提交、撕裂丢弃、暂停恢复、失败保留旧镜像
 ```

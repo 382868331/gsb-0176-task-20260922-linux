@@ -1,13 +1,13 @@
 """Offline demo of the regmirror atomic scanner.
 
-Runs three real scans against a deterministic scripted device image:
+Runs four real scans against a deterministic scripted device image:
 
 1. A clean scan that commits on the first attempt (normal result).
 2. A scan where the device rewrites a 64-bit field between two chunked
    reads -- the torn intermediate read is shown and discarded, the
    retry commits the consistent state.
-3. A device whose version register stays odd forever -- the scan
-   actually raises InconsistentScanError (rejection boundary).
+3. A scan pauses, the device changes, and resume rejects old buffered words.
+4. A failed update retains the previous complete, same-version image.
 
 Everything is computed live from the scripted image; no sleeps, no
 prerecorded output.  Expected runtime: well under 8 seconds.
@@ -19,7 +19,7 @@ from regmirror import (
     Change,
     DeviceMirror,
     FieldSpec,
-    InconsistentScanError,
+    PublishedImage,
     RegisterGroup,
     ScanConfig,
     Scanner,
@@ -76,6 +76,20 @@ class ReadLogger:
         return words
 
 
+class PauseController:
+    def __init__(self, device, session, read_index):
+        self._device = device
+        self._session = session
+        self._read_index = read_index
+        self.size = device.size
+
+    def read(self, start, count):
+        words = self._device.read(start, count)
+        if self._session is not None and self._device.read_count == self._read_index:
+            self._session.request_pause()
+        return words
+
+
 def main():
     print("=== 1. Clean scan (normal result) ===")
     dev = DeviceMirror(16, initial=image(version=2))
@@ -122,20 +136,51 @@ def main():
     assert good == 0x0A0B0C0D0E0F1011 and good != torn.raw
 
     print()
-    print("=== 3. Version stuck odd: rejection boundary actually raised ===")
-    dev = DeviceMirror(16, initial=image(version=3))  # odd forever
-    try:
-        Scanner(ScanConfig(max_attempts=4, max_read_words=2)).scan(dev, [GROUP])
-    except InconsistentScanError as exc:
-        print(f"  InconsistentScanError: {exc}")
-        print(f"  attempts used: {exc.attempts}; no field values exposed:")
-        print(f"  reasons carry version words only -> {exc.reasons[0]}")
-    else:
-        raise AssertionError("expected InconsistentScanError")
+    print("=== 3. Pause, device changes, resume rechecks version ===")
+    dev = DeviceMirror(16, initial=image(version=2))
+    scanner = Scanner(ScanConfig(max_attempts=3, max_read_words=2))
+    controlled = PauseController(dev, None, read_index=2)
+    session = scanner.start_session(controlled, [GROUP])
+    controlled._session = session
+    self_check = session.run()
+    assert self_check is None and session.status == "paused"
+    print("  paused after two reads; buffered words are unpublished")
+    dev.apply_changes(
+        [
+            Change.set_version(6, 3),
+            Change.set_words(0, ENERGY_V2 + TEMP_V2),
+            Change.set_version(6, 4),
+        ]
+    )
+    print("  device changed while paused; resume re-reads version first")
+    resumed = session.run()
+    show_snapshot(resumed)
+    assert resumed["boiler"].version == 4
+
+    print()
+    print("=== 4. Failed update keeps the previous complete image ===")
+    publisher = PublishedImage()
+    result = publisher.try_update(
+        Scanner(ScanConfig(max_attempts=2)), dev, [GROUP]
+    )
+    assert result.updated and publisher.current["boiler"].version == 4
+    print(f"  published complete image at version "
+          f"{publisher.current['boiler'].version}")
+
+    unstable = DeviceMirror(16, initial=image(version=3))  # odd forever
+    failed = publisher.try_update(
+        Scanner(ScanConfig(max_attempts=4, max_read_words=2)),
+        unstable,
+        [GROUP],
+    )
+    print(f"  update failed: {failed.error}")
+    print("  publisher still exposes only the previous complete snapshot:")
+    print(f"  retained version = {publisher.current['boiler'].version}")
+    assert not failed.updated and publisher.current["boiler"].version == 4
 
     print()
     print("demo finished: 1 committed snapshot, 1 torn read discarded,")
-    print("1 rejection boundary raised -- all computed live.")
+    print("1 rejection boundary retained the old image -- all computed live.")
 
 
 if __name__ == "__main__":

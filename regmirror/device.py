@@ -161,6 +161,17 @@ class DeviceMirror:
         self._reads += 1
         return words
 
+    def apply_changes(self, changes: Sequence[Change]) -> None:
+        """Apply a local scripted change immediately, without reading."""
+        checked = tuple(changes)
+        for i, change in enumerate(checked):
+            if not isinstance(change, Change):
+                raise TypeError(
+                    f"change {i} must be a Change, got {type(change).__name__}"
+                )
+        for change in checked:
+            self._apply(change)
+
     def _apply_step(self, index: int) -> None:
         if index >= len(self._script):
             return

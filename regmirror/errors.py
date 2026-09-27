@@ -22,6 +22,7 @@ __all__ = [
     "ConfigError",
     "AddressError",
     "DeviceReadError",
+    "ScanStateError",
     "InconsistentRead",
     "InconsistentScanError",
 ]
@@ -45,6 +46,10 @@ class AddressError(ConfigError):
 
 class DeviceReadError(RegMirrorError):
     """The device image violated the ``read(start, count)`` contract."""
+
+
+class ScanStateError(RegMirrorError):
+    """A resumable scan session was used from an invalid state."""
 
 
 @dataclass(frozen=True)
