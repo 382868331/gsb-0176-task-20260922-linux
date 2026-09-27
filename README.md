@@ -13,7 +13,7 @@
 ## 快速运行
 
 ```bash
-python -m unittest discover -s tests -v   # 35 个测试
+python -m unittest discover -s tests -v   # 46 个测试
 python demo.py                            # 约 0.1 秒，真实计算
 ```
 
@@ -27,6 +27,7 @@ from regmirror import (
     RegMirrorError, ConfigError, AddressError,
     DeviceReadError, InconsistentScanError,
 )
+from regmirror import ScanSession, SnapshotPublisher  # 暂停/恢复与发布
 
 energy = FieldSpec("energy", address=0, width=64)                 # u64
 temp   = FieldSpec("temp", address=4, width=32, signed=True,
@@ -48,6 +49,8 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
 | `RegisterGroup` | 一组字段 + 一个 16 位版本寄存器地址；字段区间不得互相重叠、不得覆盖版本寄存器 |
 | `ScanConfig` | `max_attempts`(1..1_000_000，默认 4)、`max_read_words`(1..65536，默认 16) |
 | `Snapshot` / `GroupSnapshot` | 全部组提交成功的结果；按名字索引 |
+| `ScanSession` | 可暂停/恢复的扫描会话：逐组推进，恢复时重新校验已提交组 |
+| `SnapshotPublisher` / `UpdateResult` | 只发布完整快照；重试耗尽保留上一份完整结果 |
 | `DeviceMirror` | 确定性脚本化镜像：`read(start, count)`，脚本步骤 k 在第 k 次 read 之后生效 |
 | `Change` | 脚本原语：`set_words` / `set_version` / `write_field`；同一步的元组原子生效 |
 
@@ -67,6 +70,30 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
 - **版本回绕契约**：版本相等 ⟹ 无提交，仅在"一次扫描期间设备提交
   不超过 **32767** 次"（`MAX_COMMITS_PER_SCAN = 2¹⁶/2 − 1`）时成立；
   32768 次提交会回绕到同一版本字造成混叠，这是部署契约，扫描器无法检测。
+
+## 暂停/恢复与发布
+
+- `ScanSession(scanner, device, groups)` 把一次扫描拆成逐组的 `step()`；
+  调用方可在任意两步之间暂停，所有暂停与设备变化都由本地脚本
+  （`DeviceMirror`）驱动，不需要真实设备。
+- 每个 `step()` 先**重新校验**所有已提交组：重读其版本寄存器，若与提交时
+  的偶数版本不一致（或读出奇数），说明暂停期间设备改写过，该组数据被
+  丢弃并重新排队扫描。全部组提交且最后一轮再校验全部通过后，
+  `run()` 才返回 `Snapshot`——发布的镜像不含暂停前的旧版本数据。
+- 预算契约：一个会话内每组最多扫描 `max_attempts` 次（首次 + 失效重扫），
+  超出即抛 `InconsistentScanError`，设备在每次暂停都变化不会让会话死循环。
+- `SnapshotPublisher` 持有**上一份完整快照**。`update()` 跑完整会话：成功则
+  整体替换；重试耗尽（`InconsistentScanError`）则返回
+  `UpdateResult(updated=False, snapshot=<上一份>, error=...)`，本次没有成功
+  更新，已发布内容不变。`publish()` 拒绝缺组/外来的快照，新旧版本绝不会
+  拼在一起发布。配置错误与设备契约错误照常抛出，不吞。
+
+```python
+pub = SnapshotPublisher(Scanner(ScanConfig(max_attempts=4)), device, groups)
+result = pub.update()          # 或：session = pub.new_session() 逐步驱动
+if not result.updated:
+    ...  # result.snapshot 仍是上一份完整快照；result.error 说明原因
+```
 
 ## 字节序/字序模型
 
@@ -122,7 +149,8 @@ v = snap["boiler"]["energy"]     # FieldValue: .raw, .value(Fraction), .value_fl
 ## 仓库结构
 
 ```
-regmirror/           核心库（errors / device / fields / scanner）
-tests/               35 个 unittest（期望值手工计算，独立参考）
+regmirror/           核心库（errors / device / fields / scanner / resumable）
+tests/               46 个 unittest（期望值手工计算，独立参考）
 demo.py              固定输入演示：正常提交 + 撕裂读丢弃 + 拒绝边界
+                     + 暂停/恢复再校验 + 发布失败保留旧快照
 ```

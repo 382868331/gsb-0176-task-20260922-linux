@@ -5,6 +5,8 @@ Offline, standard-library-only module.  Public surface:
 * :class:`FieldSpec` / :class:`FieldValue` -- field layout and values
 * :class:`RegisterGroup` / :class:`ScanConfig` -- scan configuration
 * :class:`Scanner` / :class:`Snapshot` / :class:`GroupSnapshot` -- scanning
+* :class:`ScanSession` / :class:`SnapshotPublisher` -- resumable scans
+  and all-or-nothing publication
 * :class:`DeviceMirror` / :class:`Change` -- deterministic scripted image
 * error hierarchy rooted at :class:`RegMirrorError`
 """
@@ -19,6 +21,7 @@ from .errors import (
     RegMirrorError,
 )
 from .fields import FieldSpec, FieldValue, decode_field, encode_field
+from .resumable import ScanSession, SnapshotPublisher, UpdateResult
 from .scanner import (
     MAX_COMMITS_PER_SCAN,
     GroupSnapshot,
@@ -45,8 +48,11 @@ __all__ = [
     "RegisterGroup",
     "RegMirrorError",
     "ScanConfig",
+    "ScanSession",
     "Scanner",
     "Snapshot",
+    "SnapshotPublisher",
+    "UpdateResult",
     "decode_field",
     "encode_field",
     "__version__",

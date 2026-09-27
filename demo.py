@@ -25,6 +25,7 @@ from regmirror import (
     Scanner,
     decode_field,
 )
+from regmirror import ScanSession, SnapshotPublisher
 
 # Register map (image size 16):
 #   0..3  energy  u64, word big / byte big
@@ -134,8 +135,71 @@ def main():
         raise AssertionError("expected InconsistentScanError")
 
     print()
+    print("=== 4. Pause/resume: device changed during the pause ===")
+    # Second group "pump": u32 flow at 8..9, version register at 10.
+    flow = FieldSpec("flow", 8, width=32)
+    pump = RegisterGroup("pump", version_address=10, fields=(flow,))
+    regs = image(version=2)
+    regs[8], regs[9], regs[10] = 0x0000, 0x0064, 2  # flow = 100
+    # The session scans one group per step; the local script pauses
+    # after step 1.  Script step 2 lands right after the 3rd read,
+    # i.e. during the pause: it rewrites boiler and bumps 2 -> 4.
+    dev = DeviceMirror(
+        16,
+        script=[
+            (),
+            (),
+            (
+                Change.set_version(6, 3),
+                Change.set_words(0, ENERGY_V2 + TEMP_V2),
+                Change.set_version(6, 4),
+            ),
+        ],
+        initial=regs,
+    )
+    session = ScanSession(Scanner(ScanConfig(max_read_words=16)), dev,
+                          [GROUP, pump])
+    session.step()  # boiler committed under version 2, then we pause
+    print(f"  after step 1: committed={session.committed_names}")
+    session.step()  # resume: revalidation finds boiler stale, drops it
+    print("  after resume: boiler version moved 2 -> 4 during pause,")
+    print(f"  revalidation dropped it: committed={session.committed_names}"
+          f" pending={session.pending_names}")
+    snap = session.run()  # boiler is rescanned against the new version
+    print("  final snapshot is fully post-pause (no old/new mix):")
+    print(f"  boiler committed under version {snap['boiler'].version}, "
+          f"energy={snap['boiler']['energy'].raw:#018x}")
+    assert snap["boiler"].version == 4
+    assert snap["boiler"]["energy"].raw == 0x0A0B0C0D0E0F1011
+    assert snap["pump"]["flow"].raw == 100
+
+    print()
+    print("=== 5. Publisher: exhausted retries keep the old snapshot ===")
+    # The first update takes exactly 9 reads (3 per group scan plus one
+    # revalidation read per committed group); script step 9 activates
+    # right after it completes and sticks the boiler version odd.
+    pub = SnapshotPublisher(
+        Scanner(ScanConfig(max_attempts=3, max_read_words=16)),
+        DeviceMirror(
+            16, script=[()] * 9 + [Change.set_version(6, 3)], initial=regs
+        ),
+        [GROUP, pump],
+    )
+    first = pub.update()
+    print(f"  first update:  updated={first.updated} "
+          f"(boiler version {first.snapshot['boiler'].version})")
+    second = pub.update()
+    print(f"  second update: updated={second.updated} "
+          f"-> {type(second.error).__name__}: {second.error}")
+    print("  published image is still the previous complete snapshot:")
+    print(f"  boiler version {pub.snapshot['boiler'].version}, "
+          f"energy={pub.snapshot['boiler']['energy'].raw:#018x}")
+    assert not second.updated and second.snapshot is first.snapshot
+
+    print()
     print("demo finished: 1 committed snapshot, 1 torn read discarded,")
-    print("1 rejection boundary raised -- all computed live.")
+    print("1 rejection boundary raised, 1 pause/resume revalidation,")
+    print("1 publisher fallback to the previous snapshot -- all live.")
 
 
 if __name__ == "__main__":

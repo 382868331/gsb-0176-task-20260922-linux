@@ -197,17 +197,18 @@ class Scanner:
         All configuration is validated before the first device read, so
         a misconfigured scan never touches the device.
         """
-        groups = self._validate(device, groups)
+        groups = self.validate(device, groups)
         committed: list[GroupSnapshot] = []
         for group in groups:
-            committed.append(self._scan_group(device, group))
+            committed.append(self.scan_group(device, group))
         return Snapshot(tuple(committed))
 
     # -- internals ------------------------------------------------------
 
-    def _validate(
+    def validate(
         self, device: object, groups: Sequence[RegisterGroup]
     ) -> tuple[RegisterGroup, ...]:
+        """Validate device/groups configuration (no device reads)."""
         if isinstance(groups, (str, bytes)) or not isinstance(groups, Sequence):
             raise ConfigError("groups must be a sequence of RegisterGroup")
         groups = tuple(groups)
@@ -246,25 +247,29 @@ class Scanner:
                 )
         return groups
 
-    def _read(self, device: object, start: int, count: int) -> tuple[int, ...]:
+    def read_words(
+        self, device: object, start: int, count: int
+    ) -> tuple[int, ...]:
+        """Read and contract-check ``count`` words from ``start``."""
         return check_read_result(start, count, device.read(start, count))
 
-    def _scan_group(
+    def scan_group(
         self, device: object, group: RegisterGroup
     ) -> GroupSnapshot:
+        """Scan one group under the version gate (up to max_attempts)."""
         first, last = group.data_span
         chunk = self.config.max_read_words
         last_reason: InconsistentRead | None = None
         for _attempt in range(1, self.config.max_attempts + 1):
-            v1 = self._read(device, group.version_address, 1)[0]
+            v1 = self.read_words(device, group.version_address, 1)[0]
             data: dict[int, int] = {}
             addr = first
             while addr <= last:
                 n = min(chunk, last - addr + 1)
-                words = self._read(device, addr, n)
+                words = self.read_words(device, addr, n)
                 data.update(zip(range(addr, addr + n), words))
                 addr += n
-            v2 = self._read(device, group.version_address, 1)[0]
+            v2 = self.read_words(device, group.version_address, 1)[0]
             if v1 == v2 and not (v1 & 1):
                 values = tuple(
                     decode_field(
